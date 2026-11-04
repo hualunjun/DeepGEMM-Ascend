@@ -115,6 +115,15 @@ public:
             sf{offset, num_rows * ceil_div(num_cols, MX_SF_DIVISOR), kNumBufferAlignmentBytes} {}
     };
 
+    struct FP4Buffer {
+        Buffer<uint8_t> data;
+        Buffer<int16_t> sf;
+
+        constexpr __aicore__ FP4Buffer(uint64_t& offset, uint64_t num_rows, uint32_t num_cols):
+            data{offset, num_rows * (num_cols / 2), kNumBufferAlignmentBytes},
+            sf{offset, num_rows * ceil_div(num_cols, MX_SF_DIVISOR), kNumBufferAlignmentBytes} {}
+    };
+
     Config config;
 
     // Reserve one packed index/weight entry per source route.
@@ -163,7 +172,7 @@ public:
     };
 
     struct {
-        FP8Buffer acts;
+        FP4Buffer acts;
         Buffer<int64_t> topk_idx;
         Buffer<float> topk_weights;
     } input{
@@ -185,7 +194,7 @@ public:
     const uint64_t num_progress_bytes = next_offset - progress.blocks.offset;
 
     struct {
-        FP8Buffer l1_acts;
+        FP4Buffer l1_acts;
 
         // Metadata uses logical rows and never wraps
         Buffer<float> topk_weights;

@@ -73,7 +73,7 @@ static auto get_symm_buffer_size_for_mega_moe(
     uint32_t num_ranks, uint32_t num_experts, uint32_t num_max_tokens_per_rank, uint32_t num_topk,
     uint32_t hidden, uint32_t intermediate_hidden, const std::string& mma_type,
     const std::string& activation, uint32_t num_shared_experts = 0) {
-    DJ_HOST_ASSERT(mma_type == "fp8xfp4" and activation == "swiglu");
+    DJ_HOST_ASSERT(mma_type == "fp4xfp4+fp8xfp4" and activation == "swiglu");
     const auto workspace = get_workspace(num_ranks, num_experts, num_max_tokens_per_rank, num_topk,
                                          hidden, intermediate_hidden, num_shared_experts);
     auto slice_input_buffers = [workspace](const torch::Tensor& buffer) {
@@ -83,7 +83,7 @@ static auto get_symm_buffer_size_for_mega_moe(
         const int64_t hidden = config.hidden, intermediate_hidden = config.intermediate_hidden;
         const int64_t num_ring_tokens = workspace.num_ring_rows;
         const int64_t shared_intermediate_hidden = config.shared_intermediate_hidden;
-        auto x = slice_buffer(buffer, workspace.input.acts.data.offset, {num_tokens, hidden}, torch::kFloat8_e4m3fn);
+        auto x = slice_buffer(buffer, workspace.input.acts.data.offset, {num_tokens, hidden / 2}, torch::kInt8);
         auto x_sf = slice_buffer(buffer, workspace.input.acts.sf.offset, {num_tokens, config.num_input_sf_pairs}, torch::kInt16);
         auto topk_idx = slice_buffer(buffer, workspace.input.topk_idx.offset, {num_tokens, config.num_topk}, torch::kInt64);
         auto topk_weights = slice_buffer(buffer, workspace.input.topk_weights.offset, {num_tokens, config.num_topk}, torch::kFloat32);
@@ -95,7 +95,7 @@ static auto get_symm_buffer_size_for_mega_moe(
         // Linear2 SFs are physical storage: [M-block, K-pair, M] with fixed BLOCK_M
         auto shared_l2_acts_sf = config.num_shared_experts > 0 ? slice_buffer(buffer, workspace.shared_l2_acts.sf.offset,
             {workspace.num_padded_shared_rows * (shared_intermediate_hidden / MX_SF_DIVISOR)}, torch::kInt16) : torch::Tensor();
-        auto l1_acts = slice_buffer(buffer, workspace.routed.l1_acts.data.offset, {num_ring_tokens, hidden}, torch::kFloat8_e4m3fn);
+        auto l1_acts = slice_buffer(buffer, workspace.routed.l1_acts.data.offset, {num_ring_tokens, hidden / 2}, torch::kInt8);
         auto l1_acts_sf = slice_buffer(buffer, workspace.routed.l1_acts.sf.offset, {num_ring_tokens, config.num_input_sf_pairs}, torch::kInt16);
         auto l2_acts = slice_buffer(buffer, workspace.routed.l2_acts.data.offset, {num_ring_tokens, intermediate_hidden}, torch::kFloat8_e4m3fn);
         auto l2_acts_sf = slice_buffer(buffer, workspace.routed.l2_acts.sf.offset,
@@ -113,12 +113,12 @@ static layout::LinearWeights check_weights(const std::tuple<torch::Tensor, torch
                                            uint32_t num_k, uint32_t num_experts_per_rank = 0) {
     const auto& [weights, weights_sf] = weights_tuple;
     const bool is_shared = num_experts_per_rank == 0;
-    DJ_HOST_ASSERT(weights.scalar_type() == (is_shared ? torch::kFloat8_e4m3fn : torch::kInt8) and weights.is_contiguous());
+    DJ_HOST_ASSERT(weights.scalar_type() == torch::kInt8 and weights.is_contiguous());
     DJ_HOST_ASSERT(weights_sf.scalar_type() == torch::kInt16 and weights_sf.is_contiguous());
     DJ_HOST_ASSERT(weights.device().type() == c10::DeviceType::PrivateUse1 and
                    weights_sf.device().type() == c10::DeviceType::PrivateUse1);
-    // Shared weights omit the expert dimension and store unpacked FP8 data.
-    const int64_t weight_shape[]{num_experts_per_rank, num_n_blocks, layout::BLOCK_N, num_k / (is_shared ? 1 : 2)};
+    // All routed and shared weights are packed FP4; shared weights omit the expert dimension.
+    const int64_t weight_shape[]{num_experts_per_rank, num_n_blocks, layout::BLOCK_N, num_k / 2};
     const int64_t sf_shape[]{num_experts_per_rank, num_n_blocks, num_k / MX_SF_DIVISOR, layout::BLOCK_N};
     DJ_HOST_ASSERT(weights.sizes() == torch::IntArrayRef(weight_shape + is_shared, 4 - is_shared));
     DJ_HOST_ASSERT(weights_sf.sizes() == torch::IntArrayRef(sf_shape + is_shared, 4 - is_shared));

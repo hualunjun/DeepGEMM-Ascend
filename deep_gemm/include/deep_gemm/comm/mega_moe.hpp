@@ -4,6 +4,8 @@
 #include <deep_gemm/layout/mega_moe.hpp>
 
 #include <c_api/asc_simd.h>
+#include <utils/debug/asc_assert.h>
+#include <utils/debug/asc_printf.h>
 #include <simt_api/device_functions.h>
 
 namespace deep_gemm::mega_moe::comm {

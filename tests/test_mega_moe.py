@@ -68,8 +68,8 @@ class MegaMoECase:
         self.transformed_shared_l1_weights = self.transformed_shared_l2_weights = None
         if num_shared_experts:
             shared_intermediate_hidden = num_shared_experts * intermediate_hidden
-            self.shared_l1_weights = make_npu_fp8((2 * shared_intermediate_hidden, hidden), 24000)
-            self.shared_l2_weights = make_npu_fp8((hidden, shared_intermediate_hidden), 25000)
+            self.shared_l1_weights = make_npu_fp4((2 * shared_intermediate_hidden, hidden), 24000)
+            self.shared_l2_weights = make_npu_fp4((hidden, shared_intermediate_hidden), 25000)
             self.transformed_shared_l1_weights, self.transformed_shared_l2_weights = deep_gemm.transform_weights_for_mega_moe(
                 self.shared_l1_weights, self.shared_l2_weights)
 
@@ -106,7 +106,7 @@ class MegaMoECase:
     def create_inputs(self, num_tokens, seed_offset=0, invalid_routes=False):
         buffer = self.buffer
         rank_idx = buffer.group.rank()
-        self.x = make_npu_fp8((num_tokens, buffer.hidden), 22000 + seed_offset + rank_idx)
+        self.x = make_npu_fp4((num_tokens, buffer.hidden), 22000 + seed_offset + rank_idx)
         self.topk_idx, self.topk_weights = make_topk(
             num_tokens, buffer.num_topk, buffer.num_experts, 23000 + seed_offset + rank_idx)
         if invalid_routes:
@@ -149,9 +149,9 @@ class MegaMoECase:
             shared_l1_y = torch.empty((self.y.size(0), 2 * buffer.num_shared_experts * buffer.intermediate_hidden),
                                       dtype=torch.bfloat16, device='npu')
             shared_y = torch.empty_like(self.y)
-            deep_gemm.fp8_gemm_nt(self.x, self.shared_l1_weights, shared_l1_y, recipe=(1, 1, 32))
+            deep_gemm.fp4_gemm_nt(self.x, self.shared_l1_weights, shared_l1_y, recipe=(1, 1, 32))
             shared_l2_x = self.swiglu(shared_l1_y)
-            deep_gemm.fp8_gemm_nt(shared_l2_x, self.shared_l2_weights, shared_y, recipe=(1, 1, 32))
+            deep_gemm.fp8_fp4_gemm_nt(shared_l2_x, self.shared_l2_weights, shared_y, recipe=(1, 1, 32))
         # DeepEP adds shared output during its FP32 combine accumulation.
         return self.ep_buffer.combine(l2_y, handle=handle, bias=shared_y)[0]
 
@@ -215,7 +215,8 @@ def benchmark(case):
     buffer = case.buffer
     hidden, intermediate = buffer.hidden, buffer.intermediate_hidden
     num_tokens, shared = case.y.size(0), buffer.num_shared_experts
-    recv_counts = buffer.expert_recv_count.cpu()
+    # Views over the symmetric buffer are not backed by NPUStorageImpl; clone first.
+    recv_counts = buffer.expert_recv_count.clone().cpu()
     num_recv_tokens = int(recv_counts.sum())
     num_touched_experts = int((recv_counts.sum(dim=0) > 0).sum())
     flops = 6 * hidden * intermediate * (num_recv_tokens + num_tokens * shared)
@@ -250,7 +251,7 @@ def test(local_rank, args):
         (hidden, intermediate), experts, topk, tokens, shared, capacity, _ = config
         return deep_gemm._C.get_symm_buffer_size_for_mega_moe(
             num_ranks, experts, max(tokens, 1) if capacity is None else capacity, topk,
-            hidden, intermediate, 'fp8xfp4', 'swiglu', shared)[0]
+            hidden, intermediate, 'fp4xfp4+fp8xfp4', 'swiglu', shared)[0]
 
     # Register once at the largest required capacity; each case gets its own layout views
     (hidden, intermediate), experts, topk, tokens, shared, capacity, _ = max(args.configs, key=buffer_size)

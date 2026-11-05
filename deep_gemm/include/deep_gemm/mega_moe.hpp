@@ -416,8 +416,6 @@ __aicore__ inline void aiv0_weight_pipeline(__gm__ uint8_t* buffer, __gm__ bfloa
                             notify<PIPE_MTE3, PIPE_MTE2>(kFP4L1Empty, fp4_l1_stage_idx);
                             fp4_l1_stage_idx = (fp4_l1_stage_idx + 1) % kNumFP4L1Stages;
                         }
-                        asc_sync_pipe(PIPE_ALL);
-                        asc_sync_data_barrier(DSB_DDR);
                         notify_intra_block<PIPE_MTE3, 0>(kL1BFull, l1b_stage_idx);
                         l1b_stage_idx = (l1b_stage_idx + 1) % kNumL1BStages;
                     }

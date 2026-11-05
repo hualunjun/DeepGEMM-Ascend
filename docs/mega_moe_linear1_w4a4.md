@@ -1177,3 +1177,86 @@ T=1024（4 个 M-block）仍存在另一处非确定性误差，且在 AIC direc
 | 5120 | 48/6 | 1 | 256 | 1.788e-7 |
 
 当前版本已保存为 `/tmp/opencode/mega_moe_av0_fp4k2_shared.hpp`。
+
+
+### 11.13 重启后 8 卡验证
+
+服务器重启后，8 卡 HCCL allreduce 正常；首次 `HcclChannelAcquire` 超时是重启后的瞬时状态，重试后恢复。
+
+当前 AIV0 + FP4 BLOCK_K/MAD_K 加倍 + A8W4 共享 B 布局的 8 卡 fused 验证（EP8，E=384，topk=6，shared=1，H/I=5120/2304）：
+
+| tokens | finite | total routes | expected | 两次运行一致 |
+|---|---|---|---|---|
+| 64 | 是 | 3072 | 3072 | 是 |
+| 256 | 是 | 12288 | 12288 | 是 |
+| 512 | 是 | 24576 | 24576 | 是 |
+| 1024 | 是 | 49152 | 49152 | 是 |
+| 4096 | 是 | 196608 | 196608 | 是 |
+| 8192 | 是 | 393216 | 393216 | 是 |
+| 16384 | 是 | 786432 | 786432 | 是 |
+
+说明：环境中没有 `deep_ep` / `tilelang`，因此 8 卡验证是 fused-only（输出 finite、route 计数、确定性），未跑 DeepEP baseline 数值对比；单卡 golden 已覆盖数值正确性。
+
+
+### 11.14 8 卡数值 golden 验证
+
+环境无 DeepEP/tilelang，因此实现了一个独立的 8 卡 PyTorch golden（`/tmp/opencode/test8_golden.py`）：
+
+- 每个 rank 用相同 seed 重建 8 个源 rank 的 x/topk；
+- 每个 rank 只计算本地 48 个 expert 的 routed 输出；
+- 通过 `all_reduce` 汇总到源 token；
+- shared expert 由各 rank 对自己 token 计算一次；
+- 与 fused `y` 比较 cosine diff / max_abs。
+
+结果（EP8，E=384，topk=6，shared=1，H/I=5120/2304）：
+
+| tokens | diff | max_abs | bit mismatch |
+|---|---|---|---|
+| 64 | 0.000e+00 | 2.560e+02 | 2059 |
+| 256 | 5.960e-08 | 2.560e+02 | 15500 |
+| 512 | 1.788e-07 | 5.120e+02 | 35681 |
+| 1024 | 0.000e+00 | 2.560e+02 | 53265 |
+
+`max_abs` 为 BF16 ULP 量级，bit mismatch 来自 routed 累加顺序/最后 BF16 舍入，cosine diff 在 `0 ~ 1.8e-7`，与单卡 golden 一致。
+
+
+### 11.15 性能测试与优化
+
+去掉 L1 B 每 stage 的 `PIPE_ALL + DSB`（FP4 BLOCK_K 加倍和共享布局后已不再需要），精度保持不变。
+
+8 卡 fused 性能（EP8，E=384，topk=6，shared=1，H/I=5120/2304）：
+
+| tokens | latency (us) | TFLOPS/rank | HBM GB/s/rank | Comm GB/s/rank |
+|---|---|---|---|---|
+| 64 | 425.26 | 74.6 | 2096.3 | 12.2 |
+| 256 | 459.03 | 276.3 | 2005.4 | 45.1 |
+| 512 | 500.45 | 506.9 | 1910.9 | 82.7 |
+| 1024 | 566.16 | 896.1 | 1815.5 | 145.8 |
+| 4096 | 1914.28 | 1060.1 | 761.3 | 172.7 |
+| 8192 | 3635.55 | 1116.4 | 558.3 | 181.9 |
+| 16384 | 7117.50 | 1140.5 | 446.1 | 185.6 |
+
+相比保留 `PIPE_ALL + DSB` 的版本，小 T 提升约 16%–21%；大 T 基本不变。去掉后 8 卡 golden 仍为 `diff 0 ~ 6e-8`，精度未回退。
+
+当前优化版本保存为 `/tmp/opencode/mega_moe_av0_fp4k2_shared_opt.hpp`。
+
+
+### 11.16 与 A8W4 的性能对比
+
+用 `e779aad^`（A8W4：Linear1/Linear2 均 W4A8，x/shared 为 FP8）构建并跑同一 8 卡 benchmark，再恢复当前 W4A4 版本。
+
+EP8，E=384，topk=6，shared=1，H/I=5120/2304：
+
+| tokens | A8W4 latency | W4A4 latency | W4A4 变化 |
+|---|---|---|---|
+| 64 | 434.21 us | 425.26 us | -2.1% |
+| 256 | 457.69 us | 459.03 us | +0.3% |
+| 512 | 495.96 us | 500.45 us | +0.9% |
+| 1024 | 716.42 us | 566.16 us | **-21.0%** |
+| 4096 | 2570.93 us | 1914.28 us | **-25.5%** |
+| 8192 | 4954.14 us | 3635.55 us | **-26.6%** |
+| 16384 | 9773.99 us | 7117.50 us | **-27.2%** |
+
+大 T 下 W4A4 明显更快（约 21%–27%），小 T 基本持平。A8W4 在 T=1024 附近有明显性能台阶，W4A4 没有。
+
+当前 W4A4 版本已恢复并重新构建，`T=64` / `T=1024` 单卡 golden 仍 PASS。

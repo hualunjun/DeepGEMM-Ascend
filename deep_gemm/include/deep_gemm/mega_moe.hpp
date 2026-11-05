@@ -109,6 +109,8 @@ constexpr PipeEvent<PIPE_MTE3, PIPE_S> kCommDone{3};
 // Linear1 B uses event 0, Linear2 B event 1, metadata event 2.
 constexpr IntraBlockEvent<0> kMetadataFull{4};
 constexpr IntraBlockEvent<0> kL1BFull{0}, kL1BEmpty{0};
+constexpr PipeEvent<PIPE_MTE1, PIPE_MTE2> kSharedL1BEmpty{5};
+constexpr PipeEvent<PIPE_MTE2, PIPE_MTE1> kSharedL1BFull{5};
 
 // AIC/AIV1: FIX -> V/S full, MTE3/S -> FIX empty
 // Linear1 and Linear2 share the same epilogue credits
@@ -309,7 +311,7 @@ __aicore__ __forceinline__ void combine_reduce(__gm__ uint8_t* buffer, __gm__ bf
 }
 
 // AIV0: Linear2 FP4 weights -> FP8 NZ -> L1B (Linear1 B is loaded directly by AIC)
-template <const auto& workspace, bool kOverlapReduce>
+template <const auto& workspace, bool kOverlapReduce, bool kLinear1FP4>
 __aicore__ inline void aiv0_weight_pipeline(__gm__ uint8_t* buffer, __gm__ bfloat16_t* output,
                                             uint32_t num_tokens, CombineReduceState<workspace>& reduce, uint32_t num_total_m_blocks,
                                             const layout::Weights& weights, uint32_t core_idx) {
@@ -317,14 +319,13 @@ __aicore__ inline void aiv0_weight_pipeline(__gm__ uint8_t* buffer, __gm__ bfloa
     constexpr uint32_t kNumRingBlocks = workspace.get_num_ring_blocks();
 
     // AIV0 UB after metadata (KiB)
-    // Region   Offset  Stages x size
-    // FP4           0      3 x 32
-    // FP8 NZ       96      2 x 64.5
-    // Reduce      225      2 stages within the remaining 31 KiB
-    // Separate UB buffers for Linear1 and Linear2 avoid cross-path reuse races.
-    constexpr uint32_t kNumFP4L1Stages = 3, kNumFP4L2Stages = 2, kNumNZL2Stages = 1;
+    // W4A4: L1 FP4 3 x 32, L2 FP4 2 x 32, NZ 1 x 64.5, reduce ~31.5.
+    // A8W4: no L1 FP4 path; restore the original L2 3 x 32 + NZ 2 x 64.5 layout.
+    constexpr uint32_t kNumFP4L1Stages = 3;
+    constexpr uint32_t kNumFP4L2Stages = kLinear1FP4 ? 2 : 3;
+    constexpr uint32_t kNumNZL2Stages = kLinear1FP4 ? 1 : 2;
     constexpr ub_ptr<uint8_t> ub_fp4_l1(1, L0BSizeBytes / 2);
-    constexpr ub_ptr<uint8_t> ub_fp4_l2(1, L0BSizeBytes / 2, ub_fp4_l1.offset(kNumFP4L1Stages));
+    constexpr ub_ptr<uint8_t> ub_fp4_l2(1, L0BSizeBytes / 2, kLinear1FP4 ? ub_fp4_l1.offset(kNumFP4L1Stages) : 0);
     constexpr ub_ptr<uint8_t> ub_nz(1, L0BSizeBytes + MMAConfig<128>::BLOCK_K, ub_fp4_l2.offset(kNumFP4L2Stages));
     constexpr auto ub_reduce_inputs = make_reduce_buffer<workspace>(ub_nz.offset(kNumNZL2Stages));
 
@@ -384,6 +385,7 @@ __aicore__ inline void aiv0_weight_pipeline(__gm__ uint8_t* buffer, __gm__ bfloa
         const uint32_t shape_m = is_shared ? num_tokens : valid_m;
 
         if (is_linear1) {
+          if constexpr (kLinear1FP4) {
             // Linear1 keeps native FP4: gather host-NZ FP4 weights into UB, then publish to L1.
             const auto load_l1_weights = [&]<uint32_t MAD_M>() __aicore__ {
                 constexpr uint32_t BLOCK_K = FP4MMAConfig<MAD_M>::BLOCK_K;
@@ -426,6 +428,12 @@ __aicore__ inline void aiv0_weight_pipeline(__gm__ uint8_t* buffer, __gm__ bfloa
             else
                 load_l1_weights.template operator()<256>();
             continue;
+          }
+        }
+
+        if constexpr (not kLinear1FP4) {
+            if (is_shared)
+                continue;
         }
 
         // Linear2 keeps W4A8: shared and routed both dequantize FP4 -> FP8.
@@ -467,7 +475,7 @@ __aicore__ inline void aiv0_weight_pipeline(__gm__ uint8_t* buffer, __gm__ bfloa
                 }
 
                 // Reduce one chunk in unused UB
-                if (not is_shared and kOverlapReduce and num_total_m_blocks > kNumRingBlocks and
+                if (not is_shared and not is_linear1 and kOverlapReduce and num_total_m_blocks > kNumRingBlocks and
                         pool_block_idx + num_reduce_window_m_blocks >= num_total_m_blocks)
                     advance_combine_reduce<workspace, kOverlapReduce>(buffer, output, num_tokens, reduce, ub_reduce_inputs, 1);
             }
@@ -480,7 +488,7 @@ __aicore__ inline void aiv0_weight_pipeline(__gm__ uint8_t* buffer, __gm__ bfloa
 }
 
 // AIC: shared and routed GEMMs
-template <const auto& workspace>
+template <const auto& workspace, bool kOverlapReduce = false, bool kLinear1FP4 = true>
 __aicore__ inline void aic_gemm_pipeline(__gm__ uint8_t* buffer, uint32_t num_tokens, uint32_t rank_idx,
                                          const layout::Weights& weights, uint32_t core_idx) {
     constexpr auto& config = workspace.config;
@@ -504,14 +512,18 @@ __aicore__ inline void aic_gemm_pipeline(__gm__ uint8_t* buffer, uint32_t num_to
     notify<PIPE_M, PIPE_MTE1, kNumL0Stages>(kL0BEmpty);
     notify<PIPE_MTE1, PIPE_MTE2, kNumL1AStages>(kL1AEmpty);
     notify<PIPE_MTE1, PIPE_MTE2, kNumSFStages>(kSFEmpty);
-    notify_intra_block<PIPE_MTE1, 0, kNumL1BStages>(kL1BEmpty);
+    if constexpr (kLinear1FP4)
+        notify_intra_block<PIPE_MTE1, 0, kNumL1BStages>(kL1BEmpty);
+    notify<PIPE_MTE1, PIPE_MTE2, 2>(kSharedL1BEmpty);
 
     sched::LinearTaskState schedule;
     sched::ExpertCursor<workspace> expert_cursors[2]{};
     uint32_t l1a_stage_idx = 0;
     uint32_t l1b_stage_idx = 0;
+    uint32_t shared_l1b_stage_idx = 0;
     uint32_t sf_stage_idx = 0;
     uint8_t num_issued_gemms = 0;
+    bool routed_l1b_initialized = false;
     uint32_t num_total_m_blocks = 0;  // Routed pool only; shared blocks are separate
     bool metadata_ready = false;
     const auto num_m_blocks_certificate = workspace.metadata.num_m_blocks_certificate.get_ptr(buffer);
@@ -534,6 +546,15 @@ __aicore__ inline void aic_gemm_pipeline(__gm__ uint8_t* buffer, uint32_t num_to
         // Decode the GEMM task
         const bool is_shared = block_phase == sched::BlockPhase::kSharedLinear1 or block_phase == sched::BlockPhase::kSharedLinear2;
         const bool is_linear1 = block_phase == sched::BlockPhase::kLinear1 or block_phase == sched::BlockPhase::kSharedLinear1;
+
+        // A8W4: AIV0 skips shared L1B; hand L1B over only after this core's shared tasks finish.
+        if constexpr (not kLinear1FP4) {
+            if (not is_shared and not routed_l1b_initialized) {
+                l1b_stage_idx = 0;
+                notify_intra_block<PIPE_MTE1, 0, kNumL1BStages>(kL1BEmpty);
+                routed_l1b_initialized = true;
+            }
+        }
 
         // Shared experts widen Linear1 N and Linear2 K
         const uint32_t intermediate_hidden = is_shared ? config.shared_intermediate_hidden : config.intermediate_hidden;
@@ -561,7 +582,8 @@ __aicore__ inline void aic_gemm_pipeline(__gm__ uint8_t* buffer, uint32_t num_to
         const auto input_layout_l1 = is_shared ? workspace.input.acts : workspace.routed.l1_acts;
         const auto input_layout_l2 = is_shared ? workspace.shared_l2_acts : workspace.routed.l2_acts;
         const uint64_t input_m_idx = static_cast<uint64_t>(input_block_idx) * BLOCK_M;
-        const auto input_l1 = input_layout_l1.data.get_ptr(buffer, input_m_idx * (num_k / 2));
+        const auto input_l1 = input_layout_l1.data.get_ptr(buffer,
+            input_m_idx * ((is_linear1 and kLinear1FP4) ? (num_k / 2) : num_k));
         const auto input_l2 = input_layout_l2.data.get_ptr(buffer, input_m_idx * num_k);
         const uintptr_t input_addr = is_linear1 ? reinterpret_cast<uintptr_t>(input_l1)
                                                 : reinterpret_cast<uintptr_t>(input_l2);
@@ -580,6 +602,7 @@ __aicore__ inline void aic_gemm_pipeline(__gm__ uint8_t* buffer, uint32_t num_to
             constexpr l1_ptr<l1a_t, Major::K> l1a(MAD_M, kL1AShapeK, 0);
             constexpr l1_ptr<float4_e2m1x2_t, Major::K> l1b_l1(MAD_N, BLOCK_K, kL1BBaseBytes);
             constexpr l1_ptr<float8_e4m3_t, Major::K> l1b_l2(MAD_N, BLOCK_K, kL1BBaseBytes);
+            constexpr l1_ptr<float8_e4m3_t, Major::K> shared_l1b(BLOCK_N, BLOCK_K, kL1BBaseBytes);
             constexpr l0a_ptr<l1a_t> l0a(MAD_M, MAD_K);
             constexpr l0b_ptr<l1a_t> l0b(MAD_N, MAD_K);
             constexpr l0c_ptr<float> l0c(MAD_M, MAD_N);
@@ -629,9 +652,31 @@ __aicore__ inline void aic_gemm_pipeline(__gm__ uint8_t* buffer, uint32_t num_to
                     notify<PIPE_MTE2, PIPE_MTE1>(kSFFull, sf_stage_idx);
                 }
 
+                if constexpr (not kLinear1FP4) {
+                    if (is_shared) {
+                        wait<PIPE_MTE1, PIPE_MTE2>(kSharedL1BEmpty, shared_l1b_stage_idx);
+                        const uint64_t weight_offset = weight_block_idx * BLOCK_N * num_k;
+                        asc_set_gm2l1_loop_size(1, 1);
+                        asc_copy_gm2l1_align(shared_l1b[shared_l1b_stage_idx].template ptr<uint8_t>(),
+                                             const_cast<__gm__ uint8_t*>(task_weights.data + weight_offset + k_idx * BLOCK_N),
+                                             1, BLOCK_N * valid_k, 0, 0, false,
+                                             reuse_shared_weights ? asc_load_l2_cache_mode::NORMAL_LAST_VICTIM
+                                                                  : asc_load_l2_cache_mode::NOTALLOC_KEEP,
+                                             BLOCK_N * BLOCK_K, BLOCK_N * BLOCK_K);
+                        notify<PIPE_MTE2, PIPE_MTE1>(kSharedL1BFull, shared_l1b_stage_idx);
+                    }
+                }
+
                 // Wait for L1 inputs
                 wait<PIPE_MTE2, PIPE_MTE1>(kL1AFull, l1a_stage_idx);
-                if constexpr (kIsFP4) {
+                if constexpr (not kLinear1FP4) {
+                    if (is_shared) {
+                        wait<PIPE_MTE2, PIPE_MTE1>(kSharedL1BFull, shared_l1b_stage_idx);
+                    } else {
+                        for (uint32_t n_mad_idx = 0; n_mad_idx < BLOCK_N; n_mad_idx += MAD_N)
+                            wait_intra_block<PIPE_MTE1, 0>(kL1BFull, (l1b_stage_idx + n_mad_idx / MAD_N) % kNumL1BStages);
+                    }
+                } else if constexpr (kIsFP4) {
                     for (uint32_t n_mad_idx = 0; n_mad_idx < BLOCK_N; n_mad_idx += MAD_N)
                         wait_intra_block<PIPE_MTE1, 0>(kL1BFull, (l1b_stage_idx + n_mad_idx / MAD_N) % kNumL1BStages);
                 } else {
@@ -656,7 +701,13 @@ __aicore__ inline void aic_gemm_pipeline(__gm__ uint8_t* buffer, uint32_t num_to
                         const uint32_t l0c_idx = n_mad_idx / MAD_N;
                         const uint32_t l0b_stage_idx = (l0a_stage_idx * (BLOCK_N / MAD_N) + l0c_idx) % kNumL0Stages;
                         wait<PIPE_M, PIPE_MTE1>(kL0BEmpty, l0b_stage_idx);
-                        if constexpr (kIsFP4) {
+                        if constexpr (not kLinear1FP4) {
+                            if (is_shared)
+                                copy_l1_to_l0b(l0b[l0b_stage_idx], shared_l1b[shared_l1b_stage_idx], n_mad_idx, k_mad_idx);
+                            else
+                                copy_l1_to_l0b(l0b[l0b_stage_idx],
+                                               l1b_l2[(l1b_stage_idx + n_mad_idx / MAD_N) % kNumL1BStages], 0, k_mad_idx);
+                        } else if constexpr (kIsFP4) {
                             copy_l1_to_l0b(l0b[l0b_stage_idx],
                                            l1b_l1[(l1b_stage_idx + n_mad_idx / MAD_N) % kNumL1BStages], 0, k_mad_idx);
                         } else {
@@ -712,7 +763,16 @@ __aicore__ inline void aic_gemm_pipeline(__gm__ uint8_t* buffer, uint32_t num_to
                 }
 
                 // Release L1 after the last L0 load
-                if constexpr (kIsFP4) {
+                if constexpr (not kLinear1FP4) {
+                    if (is_shared) {
+                        notify<PIPE_MTE1, PIPE_MTE2>(kSharedL1BEmpty, shared_l1b_stage_idx);
+                        shared_l1b_stage_idx = (shared_l1b_stage_idx + 1) % 2;
+                    } else {
+                        for (uint32_t n_mad_idx = 0; n_mad_idx < BLOCK_N; n_mad_idx += MAD_N)
+                            notify_intra_block<PIPE_MTE1, 0>(kL1BEmpty, (l1b_stage_idx + n_mad_idx / MAD_N) % kNumL1BStages);
+                        l1b_stage_idx = (l1b_stage_idx + (BLOCK_N / MAD_N)) % kNumL1BStages;
+                    }
+                } else if constexpr (kIsFP4) {
                     for (uint32_t n_mad_idx = 0; n_mad_idx < BLOCK_N; n_mad_idx += MAD_N)
                         notify_intra_block<PIPE_MTE1, 0>(kL1BEmpty, (l1b_stage_idx + n_mad_idx / MAD_N) % kNumL1BStages);
                     l1b_stage_idx = (l1b_stage_idx + (BLOCK_N / MAD_N)) % kNumL1BStages;
@@ -732,10 +792,17 @@ __aicore__ inline void aic_gemm_pipeline(__gm__ uint8_t* buffer, uint32_t num_to
         };
         const uint32_t shape_m = is_shared ? num_tokens : valid_m;
         if (is_linear1) {
-            if (shape_m <= 128)
-                compute.template operator()<128, true>();
-            else
-                compute.template operator()<256, true>();
+            if (shape_m <= 128) {
+                if constexpr (kLinear1FP4)
+                    compute.template operator()<128, true>();
+                else
+                    compute.template operator()<128, false>();
+            } else {
+                if constexpr (kLinear1FP4)
+                    compute.template operator()<256, true>();
+                else
+                    compute.template operator()<256, false>();
+            }
         } else {
             if (shape_m <= 128)
                 compute.template operator()<128, false>();
@@ -750,7 +817,7 @@ __aicore__ inline void aic_gemm_pipeline(__gm__ uint8_t* buffer, uint32_t num_to
 }
 
 // AIV1: epilogue, dispatch, and combine
-template <const auto& workspace, bool kOverlapReduce>
+template <const auto& workspace, bool kOverlapReduce, bool kLinear1FP4>
 __aicore__ inline void aiv1_epilogue_comm(__gm__ uint8_t* buffer, __gm__ bfloat16_t* output,
                                           uint32_t num_tokens, uint32_t rank_idx,
                                           CombineReduceState<workspace>& reduce,
@@ -781,7 +848,8 @@ __aicore__ inline void aiv1_epilogue_comm(__gm__ uint8_t* buffer, __gm__ bfloat1
     constexpr ub_ptr<int16_t> ub_output_sf(kNumOutputSFPairs, STORE_BLOCK_M, ub_route_weights.offset(1));
 
     // Dispatch inputs and source ranges
-    constexpr ub_ptr<uint8_t> ub_pull_token(1, config.hidden / 2, ub_output_sf.offset(kNumEpilogueStages));
+    constexpr uint32_t kHiddenBytes = kLinear1FP4 ? config.hidden / 2 : config.hidden;
+    constexpr ub_ptr<uint8_t> ub_pull_token(1, kHiddenBytes, ub_output_sf.offset(kNumEpilogueStages));
     constexpr ub_ptr<int16_t> ub_pull_sf(1, aligned(config.num_input_sf_pairs * sizeof(int16_t), kNumUBAlignmentBytes) / sizeof(int16_t),
                                          ub_pull_token.offset(kNumPullStages));
     constexpr ub_ptr<uint32_t> ub_src_m_begin(1, config.num_ranks, aligned(ub_pull_sf.offset(kNumPullStages), kNumUBAlignmentBytes));
@@ -915,22 +983,22 @@ __aicore__ inline void aiv1_epilogue_comm(__gm__ uint8_t* buffer, __gm__ bfloat1
             const uint32_t token_topk_idx = static_cast<uint32_t>(token_metadata);
             const uint32_t src_token_idx = token_topk_idx / config.num_topk;
             const uint32_t src_topk_idx = token_topk_idx % config.num_topk;
-            const auto remote_token = workspace.input.acts.data.get_ptr(
-                remote_base, static_cast<uint64_t>(src_token_idx) * (config.hidden / 2));
+            const auto remote_token = reinterpret_cast<__gm__ uint8_t*>(workspace.input.acts.data.get_ptr(
+                remote_base, static_cast<uint64_t>(src_token_idx) * kHiddenBytes));
             const auto remote_sf = workspace.input.acts.sf.get_ptr(remote_base, static_cast<uint64_t>(src_token_idx) * config.num_input_sf_pairs);
 
             // Pull token data and scales
             copy_gm_to_ub(ub_pull_token[stage_idx].ptr(), remote_token,
-                          1, config.hidden / 2, config.hidden / 2, asc_load_l2_cache_mode::NORMAL_LAST_VICTIM);
+                          1, kHiddenBytes, kHiddenBytes, asc_load_l2_cache_mode::NORMAL_LAST_VICTIM);
             copy_gm_to_ub(ub_pull_sf[stage_idx].ptr(), remote_sf, 1, config.num_input_sf_pairs,
                           config.num_input_sf_pairs * sizeof(int16_t), asc_load_l2_cache_mode::NORMAL_FIRST_VICTIM);
             notify<PIPE_MTE2, PIPE_MTE3>(kPullFull, stage_idx);
 
             // Stage routed inputs
             wait<PIPE_MTE2, PIPE_MTE3>(kPullFull, stage_idx);
-            copy_ub_to_gm(l1_acts + ring_m_idx * (config.hidden / 2),
-                          ub_pull_token[stage_idx].ptr(), 1, config.hidden / 2,
-                          config.hidden / 2, kWriteThroughShare);
+            copy_ub_to_gm(reinterpret_cast<__gm__ uint8_t*>(l1_acts) + ring_m_idx * kHiddenBytes,
+                          ub_pull_token[stage_idx].ptr(), 1, kHiddenBytes,
+                          kHiddenBytes, kWriteThroughShare);
             copy_ub_to_gm(l1_acts_sf + ring_m_idx * config.num_input_sf_pairs,
                           ub_pull_sf[stage_idx].ptr(), 1, config.num_input_sf_pairs,
                           config.num_input_sf_pairs * sizeof(int16_t), kWriteThroughShare);
@@ -1205,7 +1273,8 @@ __aicore__ inline void aiv1_epilogue_comm(__gm__ uint8_t* buffer, __gm__ bfloat1
 }
 
 template <uint32_t kNumRanks, uint32_t kNumExperts, uint32_t kNumSharedExperts,
-          uint32_t kNumMaxTokensPerRank, uint32_t kNumTopk, uint32_t kHidden, uint32_t kIntermediateHidden>
+          uint32_t kNumMaxTokensPerRank, uint32_t kNumTopk, uint32_t kHidden, uint32_t kIntermediateHidden,
+          bool kLinear1FP4 = true>
 __global__ __mix__(1, 2) void mega_moe_impl(__gm__ bfloat16_t* output, __gm__ int32_t* cumulative_local_expert_recv_stats,
                                             __gm__ const uint8_t* l1_weights, __gm__ const int16_t* l1_weights_sf,
                                             __gm__ const uint8_t* l2_weights, __gm__ const int16_t* l2_weights_sf,
@@ -1214,7 +1283,8 @@ __global__ __mix__(1, 2) void mega_moe_impl(__gm__ bfloat16_t* output, __gm__ in
                                             uint32_t num_tokens, float activation_clamp,
                                             layout::SymBuffer<> sym_buffer) {
     constexpr auto& workspace = layout::kWorkspace<kNumRanks, kNumExperts, kNumSharedExperts,
-                                                   kNumMaxTokensPerRank, kNumTopk, kHidden, kIntermediateHidden>;
+                                                   kNumMaxTokensPerRank, kNumTopk, kHidden, kIntermediateHidden,
+                                                   kLinear1FP4>;
     constexpr auto& config = workspace.config;
 
     // Measured 32 MiB combine-work threshold for tail reduction
@@ -1241,7 +1311,7 @@ __global__ __mix__(1, 2) void mega_moe_impl(__gm__ bfloat16_t* output, __gm__ in
 
     // AIC: GEMMs, then wait for both AIVs
     if ASCEND_IS_AIC {
-        aic_gemm_pipeline<workspace>(buffer, num_tokens, rank_idx, weights, core_idx);
+        aic_gemm_pipeline<workspace, kOverlapReduce, kLinear1FP4>(buffer, num_tokens, rank_idx, weights, core_idx);
         asc_sync_block_wait(PIPE_S, kCombineDoneID);
         return;
     }
@@ -1288,10 +1358,10 @@ __global__ __mix__(1, 2) void mega_moe_impl(__gm__ bfloat16_t* output, __gm__ in
         asc_store_dev(workspace.progress.metadata_ready.get_ptr(buffer, core_idx), uint8_t{1});
         notify_intra_block<PIPE_S, 0>(kMetadataFull);
 
-        aiv0_weight_pipeline<workspace, kOverlapReduce>(buffer, output, num_tokens, reduce, num_total_m_blocks, weights, core_idx);
+        aiv0_weight_pipeline<workspace, kOverlapReduce, kLinear1FP4>(buffer, output, num_tokens, reduce, num_total_m_blocks, weights, core_idx);
     } else {
         // AIV1: epilogue and communication
-        aiv1_epilogue_comm<workspace, kOverlapReduce>(buffer, output, num_tokens, rank_idx, reduce, activation_clamp, core_idx, sym_buffer);
+        aiv1_epilogue_comm<workspace, kOverlapReduce, kLinear1FP4>(buffer, output, num_tokens, rank_idx, reduce, activation_clamp, core_idx, sym_buffer);
     }
 
     combine_reduce<workspace, kOverlapReduce>(buffer, output, num_tokens, rank_idx, aiv_idx, reduce, sym_buffer);

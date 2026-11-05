@@ -25,7 +25,7 @@ class SymmBuffer:
                  mma_type: str = 'fp4xfp4+fp8xfp4',
                  activation: str = 'swiglu',
                  base: 'SymmBuffer | None' = None):
-        assert mma_type == 'fp4xfp4+fp8xfp4', 'Ascend MegaMoE W4A4 supports only fp4xfp4+fp8xfp4'
+        assert mma_type in ('fp4xfp4+fp8xfp4', 'fp8xfp4+fp8xfp4'), 'Ascend MegaMoE supports W4A4 or A8W4 Linear1'
         assert activation == 'swiglu', 'Ascend MegaMoE currently supports only swiglu'
         self.group = group
         self.num_experts = num_experts
@@ -88,7 +88,7 @@ def _transform_fp8_nz(t: torch.Tensor) -> torch.Tensor:
     return blocks.transpose(-3, -2).contiguous().view(shape).view(t.dtype)
 
 
-def _interleave_weights(t: torch.Tensor) -> torch.Tensor:
+def _interleave_weights(t: torch.Tensor, linear1_fp4: bool = True) -> torch.Tensor:
     # Gate/up pairs occupy one BLOCK_N block in both weight data and scale factors.
     assert t.dim() in (2, 3)
     dtype = t.dtype
@@ -104,10 +104,12 @@ def _interleave_weights(t: torch.Tensor) -> torch.Tensor:
     result = torch.stack((gate, up), dim=-3).reshape(*batch, num_n_blocks, BLOCK_N, k)
     # Linear1 data is stored in the L1 NZ layout for both FP8 and packed FP4;
     # 32 bytes hold 32 FP8 values or 64 FP4 values. SF (int16) stays plain.
-    return _transform_fp8_nz(result) if dtype in (torch.float8_e4m3fn, torch.int8) else result
+    if dtype == torch.float8_e4m3fn:
+        return _transform_fp8_nz(result.view(dtype))
+    return _transform_fp8_nz(result) if (dtype == torch.int8 and linear1_fp4) else result
 
 
-def _reshape_weights(t: torch.Tensor) -> torch.Tensor:
+def _reshape_weights(t: torch.Tensor, linear1_fp4: bool = True) -> torch.Tensor:
     assert t.dim() in (2, 3)
     *batch, n, k = t.shape
     assert n % BLOCK_N == 0
@@ -131,7 +133,8 @@ def _scale_fp4_weight_sf(sf: torch.Tensor) -> torch.Tensor:
 def transform_weights_for_mega_moe(
     l1_weights: tuple[torch.Tensor, torch.Tensor],
     l2_weights: tuple[torch.Tensor, torch.Tensor],
-    activation: str = 'swiglu'
+    activation: str = 'swiglu',
+    mma_type: str = 'fp4xfp4+fp8xfp4'
 ) -> tuple[tuple[torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor]]:
     """Transform routed FP4 or shared FP8 (weight, scale) pairs."""
     assert activation == 'swiglu', f'Only `swiglu` activation is supported, got `{activation}`'
@@ -146,13 +149,15 @@ def transform_weights_for_mega_moe(
     assert l1_sf.dtype == l2_sf.dtype == torch.int16
     assert l1_w.size(-1) * (2 if l1_w.dtype == torch.int8 else 1) == l1_sf.size(-1) * 64
     assert l2_w.size(-1) * (2 if l2_w.dtype == torch.int8 else 1) == l2_sf.size(-1) * 64
-    l1_w = _interleave_weights(l1_w)
+    linear1_fp4 = mma_type == 'fp4xfp4+fp8xfp4'
+    l1_w = _interleave_weights(l1_w, linear1_fp4)
     l1_sf = _interleave_weights(l1_sf).transpose(-1, -2).contiguous()
-    l2_w = _reshape_weights(l2_w)
-    l2_sf = _reshape_weights(l2_sf).transpose(-1, -2).contiguous()
+    l2_w = _reshape_weights(l2_w, linear1_fp4)
+    l2_sf = _reshape_weights(l2_sf, linear1_fp4).transpose(-1, -2).contiguous()
     if l1_w.dtype == torch.int8:
-        # Linear1 uses native FP4 MMA, so its scale is already the real E2M1 scale.
-        # Linear2 still dequantizes FP4 to FP8, which introduces 2^-6; compensate with +6.
+        # W4A4 Linear1 keeps native FP4 scale; A8W4 Linear1 dequantizes FP4->FP8 (+6).
+        if not linear1_fp4:
+            l1_sf = _scale_fp4_weight_sf(l1_sf)
         l2_sf = _scale_fp4_weight_sf(l2_sf)
     l1_transformed = (l1_w, l1_sf)
     l2_transformed = (l2_w, l2_sf)
@@ -182,6 +187,6 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
         sym_buffer.num_experts, sym_buffer.num_topk,
         sym_buffer.hidden, sym_buffer.intermediate_hidden, sym_buffer.num_shared_experts,
         recipe,
-        activation, activation_clamp,
+        activation, sym_buffer.mma_type, activation_clamp,
         fast_math
     )

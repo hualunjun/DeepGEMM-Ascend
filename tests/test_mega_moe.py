@@ -52,26 +52,28 @@ class MegaMoECase:
 
     def __init__(self, group, hidden, intermediate_hidden, num_experts, num_topk,
                  num_max_tokens_per_rank, num_shared_experts=0, activation_clamp=7.0,
-                 with_baseline=True, base=None):
+                 with_baseline=True, base=None, mma_type='fp4xfp4+fp8xfp4'):
         rank_idx, num_ranks = group.rank(), group.size()
         num_experts_per_rank = num_experts // num_ranks
+        self.mma_type = mma_type
         self.buffer = deep_gemm.SymmBuffer(
             group, num_experts, num_max_tokens_per_rank, num_topk, hidden, intermediate_hidden,
-            num_shared_experts=num_shared_experts, base=base)
+            num_shared_experts=num_shared_experts, mma_type=mma_type, base=base)
         # Match the BF16 clamp consumed by the fused kernel.
         self.activation_clamp = torch.tensor(activation_clamp, dtype=torch.bfloat16, device='cpu').item()
         self.l1_weights = make_npu_fp4((num_experts_per_rank, 2 * intermediate_hidden, hidden), 20000 + rank_idx)
         self.l2_weights = make_npu_fp4((num_experts_per_rank, hidden, intermediate_hidden), 21000 + rank_idx)
         self.transformed_l1_weights, self.transformed_l2_weights = deep_gemm.transform_weights_for_mega_moe(
-            self.l1_weights, self.l2_weights)
+            self.l1_weights, self.l2_weights, mma_type=mma_type)
         self.shared_l1_weights = self.shared_l2_weights = None
         self.transformed_shared_l1_weights = self.transformed_shared_l2_weights = None
         if num_shared_experts:
             shared_intermediate_hidden = num_shared_experts * intermediate_hidden
-            self.shared_l1_weights = make_npu_fp4((2 * shared_intermediate_hidden, hidden), 24000)
-            self.shared_l2_weights = make_npu_fp4((hidden, shared_intermediate_hidden), 25000)
+            make_shared = make_npu_fp4 if mma_type == 'fp4xfp4+fp8xfp4' else make_npu_fp8
+            self.shared_l1_weights = make_shared((2 * shared_intermediate_hidden, hidden), 24000)
+            self.shared_l2_weights = make_shared((hidden, shared_intermediate_hidden), 25000)
             self.transformed_shared_l1_weights, self.transformed_shared_l2_weights = deep_gemm.transform_weights_for_mega_moe(
-                self.shared_l1_weights, self.shared_l2_weights)
+                self.shared_l1_weights, self.shared_l2_weights, mma_type=mma_type)
 
         self.ep_buffer = None
         if with_baseline:
@@ -106,7 +108,8 @@ class MegaMoECase:
     def create_inputs(self, num_tokens, seed_offset=0, invalid_routes=False):
         buffer = self.buffer
         rank_idx = buffer.group.rank()
-        self.x = make_npu_fp4((num_tokens, buffer.hidden), 22000 + seed_offset + rank_idx)
+        make_x = make_npu_fp4 if self.mma_type == 'fp4xfp4+fp8xfp4' else make_npu_fp8
+        self.x = make_x((num_tokens, buffer.hidden), 22000 + seed_offset + rank_idx)
         self.topk_idx, self.topk_weights = make_topk(
             num_tokens, buffer.num_topk, buffer.num_experts, 23000 + seed_offset + rank_idx)
         if invalid_routes:
@@ -251,12 +254,13 @@ def test(local_rank, args):
         (hidden, intermediate), experts, topk, tokens, shared, capacity, _ = config
         return deep_gemm._C.get_symm_buffer_size_for_mega_moe(
             num_ranks, experts, max(tokens, 1) if capacity is None else capacity, topk,
-            hidden, intermediate, 'fp4xfp4+fp8xfp4', 'swiglu', shared)[0]
+            hidden, intermediate, args.mma_type, 'swiglu', shared)[0]
 
     # Register once at the largest required capacity; each case gets its own layout views
     (hidden, intermediate), experts, topk, tokens, shared, capacity, _ = max(args.configs, key=buffer_size)
     base = deep_gemm.SymmBuffer(group, experts, max(tokens, 1) if capacity is None else capacity,
-                                topk, hidden, intermediate, num_shared_experts=shared)
+                                topk, hidden, intermediate, num_shared_experts=shared,
+                                mma_type=args.mma_type)
     case_width = len(str(len(args.configs)))
     for case_idx, ((hidden, intermediate_hidden), num_experts, num_topk, num_tokens, shared, capacity, clamp) in enumerate(args.configs, 1):
         capacity = max(num_tokens, 1) if capacity is None else capacity
@@ -265,7 +269,8 @@ def test(local_rank, args):
         if local_rank == 0:
             print(f'{config} | ', end='', flush=True)
         case = MegaMoECase(group, hidden, intermediate_hidden, num_experts, num_topk, capacity, shared,
-                           activation_clamp=clamp, with_baseline=not args.skip_baseline and num_ranks > 1, base=base)
+                           activation_clamp=clamp, with_baseline=not args.skip_baseline and num_ranks > 1,
+                           base=base, mma_type=args.mma_type)
         try:
             case.create_inputs(num_tokens)
             if not args.skip_correctness:
@@ -299,6 +304,8 @@ if __name__ == '__main__':
     parser.add_argument('--num-max-tokens-per-rank', type=int, nargs='+', default=[None],
                         help='default: actual token count, at least 1')
     parser.add_argument('--activation-clamp', type=float, nargs='+', default=[7.0])
+    parser.add_argument('--mma-type', choices=('fp4xfp4+fp8xfp4', 'fp8xfp4+fp8xfp4'),
+                        default='fp4xfp4+fp8xfp4')
 
     # Test settings
     parser.add_argument('--num-correctness-tests', type=int, default=10, help='repeated runs across two inputs; 0 skips correctness')

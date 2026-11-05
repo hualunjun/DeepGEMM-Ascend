@@ -82,7 +82,8 @@ struct Weights {
 static_assert(sizeof(Weights) == 8 * sizeof(uint64_t));
 
 // GM workspace layout; all offsets are relative to the allocation base
-struct Workspace {
+template <bool kLinear1FP4>
+struct WorkspaceT {
 private:
     // Host and device use the same storage layout
 #ifdef __CCE__
@@ -123,6 +124,8 @@ public:
             data{offset, num_rows * (num_cols / 2), kNumBufferAlignmentBytes},
             sf{offset, num_rows * ceil_div(num_cols, MX_SF_DIVISOR), kNumBufferAlignmentBytes} {}
     };
+
+    using input_acts_t = std::conditional_t<kLinear1FP4, FP4Buffer, FP8Buffer>;
 
     Config config;
 
@@ -172,7 +175,7 @@ public:
     };
 
     struct {
-        FP4Buffer acts;
+        input_acts_t acts;
         Buffer<int64_t> topk_idx;
         Buffer<float> topk_weights;
     } input{
@@ -194,7 +197,7 @@ public:
     const uint64_t num_progress_bytes = next_offset - progress.blocks.offset;
 
     struct {
-        FP4Buffer l1_acts;
+        input_acts_t l1_acts;
 
         // Metadata uses logical rows and never wraps
         Buffer<float> topk_weights;
@@ -258,9 +261,13 @@ public:
     }
 };
 
+using Workspace = WorkspaceT<true>;
+using A8W4Workspace = WorkspaceT<false>;
+
 template <uint32_t kNumRanks, uint32_t kNumExperts, uint32_t kNumSharedExperts,
-          uint32_t kNumMaxTokensPerRank, uint32_t kNumTopk, uint32_t kHidden, uint32_t kIntermediateHidden>
-inline constexpr Workspace kWorkspace{{
+          uint32_t kNumMaxTokensPerRank, uint32_t kNumTopk, uint32_t kHidden, uint32_t kIntermediateHidden,
+          bool kLinear1FP4 = true>
+inline constexpr WorkspaceT<kLinear1FP4> kWorkspace{{
     kNumRanks, kNumExperts, kNumSharedExperts, kNumMaxTokensPerRank, kNumTopk, kHidden, kIntermediateHidden}};
 
 template <const auto& workspace>

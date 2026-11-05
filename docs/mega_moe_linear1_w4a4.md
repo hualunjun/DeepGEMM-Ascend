@@ -1260,3 +1260,150 @@ EP8，E=384，topk=6，shared=1，H/I=5120/2304：
 大 T 下 W4A4 明显更快（约 21%–27%），小 T 基本持平。A8W4 在 T=1024 附近有明显性能台阶，W4A4 没有。
 
 当前 W4A4 版本已恢复并重新构建，`T=64` / `T=1024` 单卡 golden 仍 PASS。
+
+
+### 11.17 mma_type 参数：W4A4 / A8W4 可切换（分支 feat/mma-type-switch）
+
+`SymmBuffer` 新增第二个合法 `mma_type`：
+
+```python
+# Linear1 W4A4（当前默认）
+buffer = SymmBuffer(..., mma_type='fp4xfp4+fp8xfp4')
+
+# Linear1 A8W4
+buffer = SymmBuffer(..., mma_type='fp8xfp4+fp8xfp4')
+```
+
+`fp8_fp4_mega_moe` 会读取 `sym_buffer.mma_type` 并选择对应 JIT kernel 实例。
+
+实现要点：
+
+- `layout::WorkspaceT<kLinear1FP4>`：
+  - `true`：`input.acts` / `routed.l1_acts` 为 FP4
+  - `false`：FP8
+- `mega_moe_impl<..., bool kLinear1FP4>`：
+  - `true`：native FP4 Linear1（current）
+  - `false`：FP8 activation + FP4→FP8 权重反量化
+- AIV1 dispatch pull 的 `hidden/2` 改为按模式取 `hidden/2` 或 `hidden`
+- `check_weights` 支持 A8W4 的输入/权重格式
+- Python `transform_weights_for_mega_moe(..., mma_type=...)`
+- `MegaMoECase(..., mma_type=...)` 自动选择 x/shared 的 FP4/FP8
+
+验证（单卡）：
+
+| 模式 | 配置 | 结果 |
+|---|---|---|
+| W4A4 | H=5120, E=1, T=1024 | diff 1.192e-7 PASS |
+| A8W4 routed | H=5120, E=1, T=64, shared=0 | diff 0 |
+| A8W4 routed+shared | H=5120, E=1, T=64, shared=1 | diff 0, max_abs 256 |
+
+说明：A8W4 模式当前 shared 权重也使用 FP4（W4），没有实现 parent A8W4 的 shared FP8 直载路径；如果 shared 必须是 FP8，需要再补 AIC direct shared FP8 分支。
+
+
+### 11.18 A8W4 shared FP8 原逻辑恢复
+
+在 `feat/mma-type-switch` 上恢复原 A8W4 的 shared FP8 路径：
+
+- A8W4 模式 shared L1/L2 权重为 FP8 E4M3；
+- AIV0 跳过 shared 权重生产；
+- AIC 直接搬 shared FP8 B：
+  - `shared_l1b(BLOCK_N, BLOCK_K)`，2 × 128 KiB
+  - `kSharedL1BFull/Empty`
+  - `asc_copy_gm2l1_align`
+- shared SF 不做 `+6`；
+- AIV1 对 shared L2 完成也发布 `kLinear2Ready`；
+- AIV0 在进入 routed B 前等待 shared L2 完成，避免 AIV0 routed B 覆盖 AIC 正在使用的 shared B。
+
+验证（NPU5，单卡）：
+
+| 模式 | 配置 | 结果 |
+|---|---|---|
+| W4A4 | H=5120/E=1/T=1024 | diff 1.192e-7 PASS |
+| A8W4 routed | H=5120/E=1/T=64/shared=0 | diff 0 |
+| A8W4 routed+shared FP8 | H=5120/E=1/T=64/shared=1 | **diff 0, max_abs 2048** |
+| A8W4 fused | H=5120/E=1/T=64/shared=1 | 56.58 us |
+
+当前 `mma_type` 已可切换：
+
+```python
+'fp4xfp4+fp8xfp4'  # W4A4 Linear1
+'fp8xfp4+fp8xfp4'  # A8W4 Linear1, shared FP8
+```
+
+
+### 11.19 多卡精度验证
+
+环境：6 卡（NPU1/2/4/5/6/7，NPU0/3 有 L0A ECC 故障），EP=6，H=5120/I=2304/E=384/topk=6/shared=1。
+使用纯 PyTorch golden（`/tmp/opencode/testN_golden.py`），阈值 `diff < 1e-4`。
+
+| mma_type | tokens | diff | 结果 |
+|---|---:|---:|---|
+| `fp4xfp4+fp8xfp4` | 64 | 1.788e-7 | PASS |
+| `fp4xfp4+fp8xfp4` | 256 | 5.960e-8 | PASS |
+| `fp4xfp4+fp8xfp4` | 1024 | 0 | PASS |
+| `fp8xfp4+fp8xfp4` | 64 | 0 | PASS |
+| `fp8xfp4+fp8xfp4` | 256 | 0 | PASS |
+| `fp8xfp4+fp8xfp4` | 1024 | 0 | PASS |
+
+两种 Linear1 模式在多卡 EP 下均与 golden 一致；max_abs 为 BF16 累加/combine 顺序造成的 ULP 级差异。
+
+
+### 11.20 W4A4 vs A8W4 多卡性能对比
+
+环境：6 卡（NPU1/2/4/5/6/7），EP=6，H=5120/I=2304/E=384/topk=6/shared=1。
+`tests/test_mega_moe.py --skip-baseline`，6 rank 同步后的 kernel 时间，取最慢 rank。
+
+| tokens | W4A4 us | A8W4 us | W4A4 加速 | W4A4 TFLOPS/rank | A8W4 TFLOPS/rank |
+|---:|---:|---:|---:|---:|---:|
+| 64 | 539.45 | 739.38 | 1.37x | 58.8 | 42.9 |
+| 256 | 577.49 | 774.74 | 1.34x | 219.6 | 163.7 |
+| 1024 | 680.23 | 869.75 | 1.28x | 745.8 | 583.3 |
+| 4096 | 2244.05 | 2775.64 | 1.24x | 904.3 | 731.1 |
+| 8192 | 4302.21 | 5322.29 | 1.24x | 943.4 | 762.6 |
+
+结论：W4A4 Linear1 在所有 token 规模都快于 A8W4，小 T 快 34%~37%，大 T 快约 24%。
+
+另外修复了 A8W4 shared 等待的 8-bit 进度回绕问题：
+`kLinear2Ready` 的 shared 完成数在 T=4096 时为 640，原 `is_block_ready` 只比较低 8 位导致 AICore timeout。
+新增 `comm::wait_for_block_u32`，AIV0 使用完整 32-bit 计数等待 shared L2 完成。
+修复后 A8W4 T=4096 6 卡 golden diff=0，benchmark 正常。
+
+
+### 11.21 8 卡性能对比
+
+环境：8 卡（NPU0~7），EP=8，H=5120/I=2304/E=384/topk=6/shared=1。
+本次 8 卡运行正常，未触发 NPU0/3 的 L0A ECC 错误。
+
+| tokens | W4A4 us | A8W4 us | W4A4 加速 | W4A4 TFLOPS/rank | A8W4 TFLOPS/rank |
+|---:|---:|---:|---:|---:|---:|
+| 64 | 424.76 | 567.38 | 1.34x | 74.7 | 55.9 |
+| 256 | 460.19 | 599.72 | 1.30x | 275.6 | 211.5 |
+| 1024 | 566.43 | 722.40 | 1.28x | 895.7 | 702.3 |
+| 4096 | 1908.58 | 2590.69 | 1.36x | 1063.3 | 783.3 |
+| 8192 | 3634.44 | 5024.29 | 1.38x | 1116.7 | 807.8 |
+
+8 卡下 W4A4 仍全面领先：T=64 快 34%，T=256/1024 快 28%~30%，T=4096/8192 快 36%~38%。
+
+
+### 11.22 参照原始 A8W4 修复性能回归
+
+对比原始 A8W4（`3a35326`）后定位到两个差异，并已恢复：
+
+1. **L1B 交接方式**：原始 AIC 在初始化时不发放 `kL1BEmpty` 信用，而是在进入本 core 第一个 routed task 时一次性 `notify kNumL1BStages` 给 AIV0；AIV0 写 routed B 前等待该 intra-block 信用。这样只在本 core 的 shared task 完成后交接，不需要跨 core 的全局 `kLinear2Ready` 等待。
+2. **AIV0 UB 排布**：原始 A8W4 使用 L2 FP4 **3 stage** + FP8 NZ **2 stage**。当前 W4A4 优化版是 2 + 1；A8W4 没有 L1 FP4 路径，却错误沿用了 2 + 1，导致去量化流水重叠不足。现按模式区分：
+   - W4A4：L1 3×32K、L2 2×32K、NZ 1×64.5K
+   - A8W4：L2 3×32K、NZ 2×64.5K（从 UB offset 0 开始，无 L1 FP4 占用）
+
+恢复后 A8W4 8 卡性能回到原始水平，且 routed+shared golden 仍通过。
+
+最终 8 卡对比（EP=8，H=5120/I=2304/E=384/topk=6/shared=1）：
+
+| tokens | W4A4 us | A8W4 us | W4A4 加速 | W4A4 TFLOPS/rank | A8W4 TFLOPS/rank |
+|---:|---:|---:|---:|---:|---:|
+| 64 | 425.04 | 434.65 | 1.02x | 74.6 | 73.0 |
+| 256 | 459.69 | 459.04 | 1.00x | 275.9 | 276.3 |
+| 1024 | 566.32 | 715.79 | 1.26x | 895.9 | 708.8 |
+| 4096 | 1908.38 | 2587.05 | 1.36x | 1063.4 | 784.4 |
+| 8192 | 3631.49 | 5016.95 | 1.38x | 1117.7 | 809.0 |
+
+A8W4 精度（6 卡 golden）：T=64/1024/4096 均 `diff=0`。

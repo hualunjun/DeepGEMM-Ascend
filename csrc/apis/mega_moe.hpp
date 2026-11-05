@@ -24,7 +24,8 @@ namespace deep_gemm::mega_moe {
 
 namespace py = pybind11;
 
-static layout::Workspace get_workspace(uint32_t num_ranks, uint32_t num_experts,
+template <bool kLinear1FP4>
+static layout::WorkspaceT<kLinear1FP4> get_workspace(uint32_t num_ranks, uint32_t num_experts,
                                        uint32_t num_max_tokens_per_rank, uint32_t num_topk,
                                        uint32_t hidden, uint32_t intermediate_hidden, uint32_t num_shared_experts) {
     DJ_HOST_ASSERT(num_ranks > 0 and num_ranks < 256);
@@ -37,8 +38,8 @@ static layout::Workspace get_workspace(uint32_t num_ranks, uint32_t num_experts,
                    intermediate_hidden % layout::BLOCK_N == 0);
     DJ_HOST_ASSERT(static_cast<uint64_t>(num_ranks) * num_max_tokens_per_rank * num_topk <
                    layout::kCountArrivalBit);
-    return layout::Workspace{{num_ranks, num_experts, num_shared_experts, num_max_tokens_per_rank,
-                              num_topk, hidden, intermediate_hidden}};
+    return layout::WorkspaceT<kLinear1FP4>{{num_ranks, num_experts, num_shared_experts, num_max_tokens_per_rank,
+                                             num_topk, hidden, intermediate_hidden}};
 }
 
 // The root Tensor owns the HCCL lease; data views borrow its memory
@@ -69,13 +70,12 @@ static torch::Tensor slice_buffer(const torch::Tensor& buffer, uint64_t offset,
     return torch::from_blob(static_cast<uint8_t*>(buffer.data_ptr()) + offset, shape, buffer.options().dtype(dtype));
 }
 
-static auto get_symm_buffer_size_for_mega_moe(
+template <bool kLinear1FP4>
+static auto get_symm_buffer_size_for_mega_moe_impl(
     uint32_t num_ranks, uint32_t num_experts, uint32_t num_max_tokens_per_rank, uint32_t num_topk,
-    uint32_t hidden, uint32_t intermediate_hidden, const std::string& mma_type,
-    const std::string& activation, uint32_t num_shared_experts = 0) {
-    DJ_HOST_ASSERT(mma_type == "fp4xfp4+fp8xfp4" and activation == "swiglu");
-    const auto workspace = get_workspace(num_ranks, num_experts, num_max_tokens_per_rank, num_topk,
-                                         hidden, intermediate_hidden, num_shared_experts);
+    uint32_t hidden, uint32_t intermediate_hidden, uint32_t num_shared_experts = 0) {
+    const auto workspace = get_workspace<kLinear1FP4>(num_ranks, num_experts, num_max_tokens_per_rank, num_topk,
+                                                      hidden, intermediate_hidden, num_shared_experts);
     auto slice_input_buffers = [workspace](const torch::Tensor& buffer) {
         DJ_HOST_ASSERT(buffer.nbytes() >= workspace.get_num_bytes());
         const auto& config = workspace.config;
@@ -83,7 +83,9 @@ static auto get_symm_buffer_size_for_mega_moe(
         const int64_t hidden = config.hidden, intermediate_hidden = config.intermediate_hidden;
         const int64_t num_ring_tokens = workspace.num_ring_rows;
         const int64_t shared_intermediate_hidden = config.shared_intermediate_hidden;
-        auto x = slice_buffer(buffer, workspace.input.acts.data.offset, {num_tokens, hidden / 2}, torch::kInt8);
+        auto x = kLinear1FP4
+            ? slice_buffer(buffer, workspace.input.acts.data.offset, {num_tokens, hidden / 2}, torch::kInt8)
+            : slice_buffer(buffer, workspace.input.acts.data.offset, {num_tokens, hidden}, torch::kFloat8_e4m3fn);
         auto x_sf = slice_buffer(buffer, workspace.input.acts.sf.offset, {num_tokens, config.num_input_sf_pairs}, torch::kInt16);
         auto topk_idx = slice_buffer(buffer, workspace.input.topk_idx.offset, {num_tokens, config.num_topk}, torch::kInt64);
         auto topk_weights = slice_buffer(buffer, workspace.input.topk_weights.offset, {num_tokens, config.num_topk}, torch::kFloat32);
@@ -95,7 +97,9 @@ static auto get_symm_buffer_size_for_mega_moe(
         // Linear2 SFs are physical storage: [M-block, K-pair, M] with fixed BLOCK_M
         auto shared_l2_acts_sf = config.num_shared_experts > 0 ? slice_buffer(buffer, workspace.shared_l2_acts.sf.offset,
             {workspace.num_padded_shared_rows * (shared_intermediate_hidden / MX_SF_DIVISOR)}, torch::kInt16) : torch::Tensor();
-        auto l1_acts = slice_buffer(buffer, workspace.routed.l1_acts.data.offset, {num_ring_tokens, hidden / 2}, torch::kInt8);
+        auto l1_acts = kLinear1FP4
+            ? slice_buffer(buffer, workspace.routed.l1_acts.data.offset, {num_ring_tokens, hidden / 2}, torch::kInt8)
+            : slice_buffer(buffer, workspace.routed.l1_acts.data.offset, {num_ring_tokens, hidden}, torch::kFloat8_e4m3fn);
         auto l1_acts_sf = slice_buffer(buffer, workspace.routed.l1_acts.sf.offset, {num_ring_tokens, config.num_input_sf_pairs}, torch::kInt16);
         auto l2_acts = slice_buffer(buffer, workspace.routed.l2_acts.data.offset, {num_ring_tokens, intermediate_hidden}, torch::kFloat8_e4m3fn);
         auto l2_acts_sf = slice_buffer(buffer, workspace.routed.l2_acts.sf.offset,
@@ -109,23 +113,41 @@ static auto get_symm_buffer_size_for_mega_moe(
     return std::make_tuple(workspace.get_num_bytes(), std::function(slice_input_buffers));
 }
 
+static auto get_symm_buffer_size_for_mega_moe(
+    uint32_t num_ranks, uint32_t num_experts, uint32_t num_max_tokens_per_rank, uint32_t num_topk,
+    uint32_t hidden, uint32_t intermediate_hidden, const std::string& mma_type,
+    const std::string& activation, uint32_t num_shared_experts = 0) {
+    DJ_HOST_ASSERT(activation == "swiglu");
+    if (mma_type == "fp4xfp4+fp8xfp4")
+        return get_symm_buffer_size_for_mega_moe_impl<true>(num_ranks, num_experts, num_max_tokens_per_rank,
+            num_topk, hidden, intermediate_hidden, num_shared_experts);
+    if (mma_type == "fp8xfp4+fp8xfp4")
+        return get_symm_buffer_size_for_mega_moe_impl<false>(num_ranks, num_experts, num_max_tokens_per_rank,
+            num_topk, hidden, intermediate_hidden, num_shared_experts);
+    DJ_HOST_ASSERT(false, "Unsupported mma_type: {}", mma_type);
+}
+
 static layout::LinearWeights check_weights(const std::tuple<torch::Tensor, torch::Tensor>& weights_tuple, uint32_t num_n_blocks,
-                                           uint32_t num_k, uint32_t num_experts_per_rank = 0) {
+                                           uint32_t num_k, uint32_t num_experts_per_rank = 0, bool packed_fp4 = true) {
     const auto& [weights, weights_sf] = weights_tuple;
     const bool is_shared = num_experts_per_rank == 0;
-    DJ_HOST_ASSERT(weights.scalar_type() == torch::kInt8 and weights.is_contiguous());
+    DJ_HOST_ASSERT((packed_fp4 ? weights.scalar_type() == torch::kInt8
+                               : (weights.scalar_type() == torch::kInt8 or weights.scalar_type() == torch::kFloat8_e4m3fn)) and
+                   weights.is_contiguous());
     DJ_HOST_ASSERT(weights_sf.scalar_type() == torch::kInt16 and weights_sf.is_contiguous());
     DJ_HOST_ASSERT(weights.device().type() == c10::DeviceType::PrivateUse1 and
                    weights_sf.device().type() == c10::DeviceType::PrivateUse1);
-    // All routed and shared weights are packed FP4; shared weights omit the expert dimension.
-    const int64_t weight_shape[]{num_experts_per_rank, num_n_blocks, layout::BLOCK_N, num_k / 2};
+    // Routed weights are packed FP4; A8W4 shared weights are FP8. Shared omits the expert dimension.
+    const int64_t packed_k = packed_fp4 ? num_k / 2 : num_k;
+    const int64_t weight_shape[]{num_experts_per_rank, num_n_blocks, layout::BLOCK_N, packed_k};
     const int64_t sf_shape[]{num_experts_per_rank, num_n_blocks, num_k / MX_SF_DIVISOR, layout::BLOCK_N};
     DJ_HOST_ASSERT(weights.sizes() == torch::IntArrayRef(weight_shape + is_shared, 4 - is_shared));
     DJ_HOST_ASSERT(weights_sf.sizes() == torch::IntArrayRef(sf_shape + is_shared, 4 - is_shared));
     return {static_cast<const uint8_t*>(weights.data_ptr()), static_cast<const int16_t*>(weights_sf.data_ptr())};
 }
 
-static void fp8_fp4_mega_moe(
+template <bool kLinear1FP4>
+static void fp8_fp4_mega_moe_impl(
     const torch::Tensor& y,
     const std::tuple<torch::Tensor, torch::Tensor>& l1_weights_tuple,
     const std::tuple<torch::Tensor, torch::Tensor>& l2_weights_tuple,
@@ -150,8 +172,8 @@ static void fp8_fp4_mega_moe(
     DJ_HOST_ASSERT(hidden > 0 and intermediate_hidden > 0 and num_shared_experts >= 0);
     const auto num_ranks = static_cast<uint32_t>(sym_buffer_ptrs.size());
     // Use the registered layout dimensions, then validate tensors against them.
-    const auto workspace = get_workspace(num_ranks, num_experts, num_max_tokens_per_rank, num_topk,
-                                         hidden, intermediate_hidden, num_shared_experts);
+    const auto workspace = get_workspace<kLinear1FP4>(num_ranks, num_experts, num_max_tokens_per_rank, num_topk,
+                                                      hidden, intermediate_hidden, num_shared_experts);
     DJ_HOST_ASSERT(y.dim() == 2 and y.size(0) <= num_max_tokens_per_rank and y.size(1) == hidden);
     DJ_HOST_ASSERT(shared_l1_weights_tuple_opt.has_value() == (num_shared_experts > 0) and
                    shared_l2_weights_tuple_opt.has_value() == (num_shared_experts > 0));
@@ -177,19 +199,23 @@ static void fp8_fp4_mega_moe(
     }
 
     // Check transformed weights and scales
-    const auto l1 = check_weights(l1_weights_tuple, intermediate_hidden / (layout::BLOCK_N / 2), hidden, num_experts_per_rank);
-    const auto l2 = check_weights(l2_weights_tuple, hidden / layout::BLOCK_N, intermediate_hidden, num_experts_per_rank);
+    const auto l1 = check_weights(l1_weights_tuple, intermediate_hidden / (layout::BLOCK_N / 2), hidden,
+                                  num_experts_per_rank, true);
+    const auto l2 = check_weights(l2_weights_tuple, hidden / layout::BLOCK_N, intermediate_hidden,
+                                  num_experts_per_rank, true);
     layout::LinearWeights shared_l1{}, shared_l2{};
     if (num_shared_experts > 0) {
         shared_l1 = check_weights(shared_l1_weights_tuple_opt.value(),
-                                  workspace.config.shared_intermediate_hidden / (layout::BLOCK_N / 2), hidden);
+                                  workspace.config.shared_intermediate_hidden / (layout::BLOCK_N / 2), hidden, 0,
+                                  kLinear1FP4);
         shared_l2 = check_weights(shared_l2_weights_tuple_opt.value(),
-                                  hidden / layout::BLOCK_N, workspace.config.shared_intermediate_hidden);
+                                  hidden / layout::BLOCK_N, workspace.config.shared_intermediate_hidden, 0,
+                                  kLinear1FP4);
     }
     // NOTES: All weights/SFs must be on the current device, like y and sym_buffer
     const auto activation_clamp = activation_clamp_opt.value_or(std::numeric_limits<float>::infinity());
     DJ_HOST_ASSERT(activation_clamp >= 0);
-    launch_mega_moe({
+    launch_mega_moe<kLinear1FP4>({
         .workspace = workspace,
         .buffer = sym_buffer.data_ptr(),
         .sym_buffer_ptrs = sym_buffer_ptrs,
@@ -201,6 +227,38 @@ static void fp8_fp4_mega_moe(
         .num_tokens = num_tokens,
         .activation_clamp = static_cast<float>(c10::BFloat16(activation_clamp)),
     });
+}
+
+static void fp8_fp4_mega_moe(
+    const torch::Tensor& y,
+    const std::tuple<torch::Tensor, torch::Tensor>& l1_weights_tuple,
+    const std::tuple<torch::Tensor, torch::Tensor>& l2_weights_tuple,
+    const std::optional<std::tuple<torch::Tensor, torch::Tensor>>& shared_l1_weights_tuple_opt,
+    const std::optional<std::tuple<torch::Tensor, torch::Tensor>>& shared_l2_weights_tuple_opt,
+    const std::optional<torch::Tensor>& cumulative_local_expert_recv_stats,
+    const torch::Tensor& sym_buffer,
+    const std::vector<int64_t>& sym_buffer_ptrs, const int& rank_idx,
+    const int& num_max_tokens_per_rank,
+    const int& num_experts, const int& num_topk,
+    const int& hidden, const int& intermediate_hidden, const int& num_shared_experts,
+    const std::tuple<int, int, int>& recipe,
+    const std::string& activation, const std::string& mma_type,
+    const std::optional<float>& activation_clamp_opt,
+    const bool& fast_math
+) {
+    if (mma_type == "fp4xfp4+fp8xfp4")
+        return fp8_fp4_mega_moe_impl<true>(y, l1_weights_tuple, l2_weights_tuple,
+            shared_l1_weights_tuple_opt, shared_l2_weights_tuple_opt,
+            cumulative_local_expert_recv_stats, sym_buffer, sym_buffer_ptrs, rank_idx,
+            num_max_tokens_per_rank, num_experts, num_topk, hidden, intermediate_hidden,
+            num_shared_experts, recipe, activation, activation_clamp_opt, fast_math);
+    if (mma_type == "fp8xfp4+fp8xfp4")
+        return fp8_fp4_mega_moe_impl<false>(y, l1_weights_tuple, l2_weights_tuple,
+            shared_l1_weights_tuple_opt, shared_l2_weights_tuple_opt,
+            cumulative_local_expert_recv_stats, sym_buffer, sym_buffer_ptrs, rank_idx,
+            num_max_tokens_per_rank, num_experts, num_topk, hidden, intermediate_hidden,
+            num_shared_experts, recipe, activation, activation_clamp_opt, fast_math);
+    DJ_HOST_ASSERT(false, "Unsupported mma_type: {}", mma_type);
 }
 
 static void register_apis(py::module_& m) {
@@ -221,7 +279,7 @@ static void register_apis(py::module_& m) {
           py::arg("sym_buffer_ptrs"), py::arg("rank_idx"), py::arg("num_max_tokens_per_rank"),
           py::arg("num_experts"), py::arg("num_topk"), py::arg("hidden"),
           py::arg("intermediate_hidden"), py::arg("num_shared_experts"), py::arg("recipe"),
-          py::arg("activation"), py::arg("activation_clamp_opt"), py::arg("fast_math"));
+          py::arg("activation"), py::arg("mma_type"), py::arg("activation_clamp_opt"), py::arg("fast_math"));
 }
 
 } // namespace deep_gemm::mega_moe

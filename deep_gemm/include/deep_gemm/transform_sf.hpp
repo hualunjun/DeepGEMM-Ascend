@@ -5,6 +5,7 @@
 
 #include <deep_gemm/ascend.hpp>
 #include <c_api/asc_simd.h>
+#include <utils/debug/asc_assert.h>
 
 using namespace __cce_simd;
 

@@ -152,7 +152,7 @@ class MegaMoECase:
             shared_l1_y = torch.empty((self.y.size(0), 2 * buffer.num_shared_experts * buffer.intermediate_hidden),
                                       dtype=torch.bfloat16, device='npu')
             shared_y = torch.empty_like(self.y)
-            deep_gemm.fp4_gemm_nt(self.x, self.shared_l1_weights, shared_l1_y, recipe=(1, 1, 32))
+            deep_gemm.fp8_fp4_gemm_nt(self.x, self.shared_l1_weights, shared_l1_y, recipe=(1, 1, 32))
             shared_l2_x = self.swiglu(shared_l1_y)
             deep_gemm.fp8_fp4_gemm_nt(shared_l2_x, self.shared_l2_weights, shared_y, recipe=(1, 1, 32))
         # DeepEP adds shared output during its FP32 combine accumulation.

@@ -1407,3 +1407,62 @@ buffer = SymmBuffer(..., mma_type='fp8xfp4+fp8xfp4')
 | 8192 | 3631.49 | 5016.95 | 1.38x | 1117.7 | 809.0 |
 
 A8W4 精度（6 卡 golden）：T=64/1024/4096 均 `diff=0`。
+
+
+### 11.23 Linear2 A4W4（FP4 激活 × FP4 权重）
+
+新增 `mma_type='fp4xfp4+fp4xfp4'`，Linear2 从 A8W4 改为 native A4W4：
+
+- `l2_acts` / `shared_l2_acts` 改为 `FP4Buffer`；
+- AIV1 新增 `vf_swiglu_quant_fp4`：
+  - scale = `ceil_ue8m0(amax / 6)`；
+  - BF16 舍入后 RNE 到 E2M1；
+  - 每字节打包两个 FP4，SF 直接写 E2M1 scale；
+- AIV0 Linear2 权重走 K-major packed FP4，直接写 L1B，不再 FP4→FP8 反量化；
+- AIC Linear2 使用 `FP4MMAConfig`；因 `I=2304` 不能被 `MAD_M=128` 的 FP4 `MAD_K` 整除，Linear2 固定 `MAD_M=256`；
+- L1/L2 FP4 的 MTE2/MTE3 event base 分开，避免信用冲突。
+
+验证：
+
+| 场景 | 结果 |
+|---|---|
+| 单卡 E=1/T=64/shared=1 | diff 1.192e-7 PASS |
+| 8 卡 T=64 | diff 2.384e-7 PASS |
+| 8 卡 T=1024 | diff 1.788e-7 PASS |
+| 8 卡 T=4096 | precision 脚本 vector core exception，benchmark 正常 |
+
+8 卡性能：
+
+| tokens | W4A8 Linear2 | A4W4 Linear2 | 加速 |
+|---:|---:|---:|---:|
+| 64 | 425.04 | 363.38 | 1.17x |
+| 256 | 459.69 | 406.04 | 1.13x |
+| 1024 | 566.32 | 542.31 | 1.04x |
+| 4096 | 1908.38 | 1849.02 | 1.03x |
+| 8192 | 3631.49 | 3671.16 | 0.99x |
+
+小/中 T 有 4%~17% 收益；T=8192 基本持平。
+
+
+### 11.24 A4W4 Linear2 大 Shape 收益衰减分析
+
+8 卡 T=8192 msprof PIPE 时间（rank 0，单位 us）：
+
+| PIPE | A8W4 Linear2 | A4W4 Linear2 |
+|---|---:|---:|
+| kernel | 3735 | 3624 |
+| AIC PIPE_M | 3336.6 | 3269.2 |
+| AIC MTE2 | 2206.4 | 2259.0 |
+| AIC FIX | 1069.5 | 1091.4 |
+| AIV0 MTE2 | 1753.7 | 1746.6 |
+| AIV1 MTE2 | 1664.8 | 1559.4 |
+| AIV1 MTE3 | 1346.2 | 1265.3 |
+| AIV1 PIPE_V | 1394.9 | 1394.5 |
+
+结论：
+
+1. 大 T 时 AIC `PIPE_M` 约 3.3 ms，占 kernel 的 88%，是关键路径。
+2. L2 改成 native FP4 后 AIC `PIPE_M` 只下降约 2%，说明当前 FP4 MMA 配置没有带来预期 2x cube 吞吐提升；FP4 的收益主要来自 A 侧带宽减半和去掉 AIV0 反量化，这些在 T=8192 已不在关键路径。
+3. AIV0 权重 MTE2、AIV1 通信/激活在两种模式下基本相同，A4W4 不改善。
+4. 因此大 T 收益被 AIC cube 限制；T=8192 的 benchmark 差异也在测量噪声范围内。
+5. 后续优化重点应放在 AIC L0/L1 流水、FP4 MMA 实际利用率和 combine/AIC 重叠，而不是继续减少 A 字节。

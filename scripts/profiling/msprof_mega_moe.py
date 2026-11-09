@@ -32,7 +32,7 @@ def worker(local_rank, args):
     rank, _, group = init_dist(local_rank, args.ranks)
     case = None
     try:
-        case = MegaMoECase(group, *args.case, with_baseline=False)
+        case = MegaMoECase(group, *args.case, with_baseline=False, mma_type=args.mma_type)
         case.create_inputs(args.case[4])
         for _ in range(args.warmups):
             case.run_fused()
@@ -154,6 +154,8 @@ def main():
     parser.add_argument('--output', type=Path, help='JSON output directory; new captures go in its raw/ subdirectory')
     parser.add_argument('--capture', type=Path, help='export an existing PROF_* directory or its parent without collecting')
     parser.add_argument('--ranks', type=int, default=8)
+    parser.add_argument('--mma-type', default='fp4xfp4+fp8xfp4',
+                        choices=('fp4xfp4+fp8xfp4', 'fp8xfp4+fp8xfp4', 'fp4xfp4+fp4xfp4'))
     parser.add_argument('--case', type=lambda s: tuple(map(int, s.split(','))),
                         default=(4096, 2048, 64, 6, 8192, 1), metavar='H,I,E,K,T,S')
     parser.add_argument('--warmups', type=int, default=3)

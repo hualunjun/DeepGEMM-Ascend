@@ -8,9 +8,9 @@
 
 namespace deep_gemm {
 
-template <bool kLinear1FP4>
+template <bool kLinear1FP4, bool kLinear2FP4>
 struct MegaMoEArgs {
-    const mega_moe::layout::WorkspaceT<kLinear1FP4>& workspace;
+    const mega_moe::layout::WorkspaceT<kLinear1FP4, kLinear2FP4>& workspace;
 
     void* buffer;
     const std::vector<int64_t>& sym_buffer_ptrs;
@@ -22,20 +22,20 @@ struct MegaMoEArgs {
     float activation_clamp;
 };
 
-template <bool kLinear1FP4>
-static void launch_mega_moe(const MegaMoEArgs<kLinear1FP4>& args) {
+template <bool kLinear1FP4, bool kLinear2FP4>
+static void launch_mega_moe(const MegaMoEArgs<kLinear1FP4, kLinear2FP4>& args) {
     const auto& workspace = args.workspace;
     const auto& config = workspace.config;
     const auto code = std::format(R"(
 #include <deep_gemm/mega_moe.hpp>
 
 static void __instantiate() {{
-    auto p = reinterpret_cast<void*>(&deep_gemm::mega_moe::mega_moe_impl<{}, {}, {}, {}, {}, {}, {}, {}>);
+    auto p = reinterpret_cast<void*>(&deep_gemm::mega_moe::mega_moe_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}>);
 }}
 
 )",
         config.num_ranks, config.num_experts, config.num_shared_experts, config.num_max_tokens_per_rank,
-        config.num_topk, config.hidden, config.intermediate_hidden, kLinear1FP4);
+        config.num_topk, config.hidden, config.intermediate_hidden, kLinear1FP4, kLinear2FP4);
     if (runtime->get_dry_run()) {
         jit->compile_without_load("mega_moe", code);
         return;

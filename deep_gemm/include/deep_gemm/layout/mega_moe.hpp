@@ -82,7 +82,7 @@ struct Weights {
 static_assert(sizeof(Weights) == 8 * sizeof(uint64_t));
 
 // GM workspace layout; all offsets are relative to the allocation base
-template <bool kLinear1FP4>
+template <bool kLinear1FP4, bool kLinear2FP4 = false>
 struct WorkspaceT {
 private:
     // Host and device use the same storage layout
@@ -126,6 +126,7 @@ public:
     };
 
     using input_acts_t = std::conditional_t<kLinear1FP4, FP4Buffer, FP8Buffer>;
+    using l2_acts_t = std::conditional_t<kLinear2FP4, FP4Buffer, FP8Buffer>;
 
     Config config;
 
@@ -204,7 +205,7 @@ public:
         Buffer<uint32_t> src_metadata;
 
         // Input SF is token-major; quantized Linear2 SF is K-major within each M-block
-        FP8Buffer l2_acts;
+        l2_acts_t l2_acts;
         Buffer<bf16_t> output;
     } routed{
         .l1_acts = {next_offset, num_ring_rows, config.hidden},
@@ -220,7 +221,7 @@ public:
         kNumBufferAlignmentBytes};
 
     // Shared Linear2 inputs; Linear1 reads original tokens
-    FP8Buffer shared_l2_acts{next_offset, config.num_shared_experts > 0 ? num_padded_shared_rows : 0, config.shared_intermediate_hidden};
+    l2_acts_t shared_l2_acts{next_offset, config.num_shared_experts > 0 ? num_padded_shared_rows : 0, config.shared_intermediate_hidden};
 
     // Producer M-block for each input route; dispatch fills this before publishing readiness
     Buffer<uint32_t> route_m_blocks{
@@ -261,13 +262,15 @@ public:
     }
 };
 
-using Workspace = WorkspaceT<true>;
-using A8W4Workspace = WorkspaceT<false>;
+using Workspace = WorkspaceT<true, false>;
+using A8W4Workspace = WorkspaceT<false, false>;
+using A4W4Workspace = WorkspaceT<true, true>;
+using A8W4A4W4Workspace = WorkspaceT<false, true>;
 
 template <uint32_t kNumRanks, uint32_t kNumExperts, uint32_t kNumSharedExperts,
           uint32_t kNumMaxTokensPerRank, uint32_t kNumTopk, uint32_t kHidden, uint32_t kIntermediateHidden,
-          bool kLinear1FP4 = true>
-inline constexpr WorkspaceT<kLinear1FP4> kWorkspace{{
+          bool kLinear1FP4 = true, bool kLinear2FP4 = false>
+inline constexpr WorkspaceT<kLinear1FP4, kLinear2FP4> kWorkspace{{
     kNumRanks, kNumExperts, kNumSharedExperts, kNumMaxTokensPerRank, kNumTopk, kHidden, kIntermediateHidden}};
 
 template <const auto& workspace>

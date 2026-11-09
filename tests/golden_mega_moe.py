@@ -72,7 +72,7 @@ def decode_fp4(data: torch.Tensor, sf: torch.Tensor, num_cols: int) -> torch.Ten
     return values * scale
 
 
-def quantize_fp8_golden(values: torch.Tensor) -> torch.Tensor:
+def quantize_fp8_golden(values: torch.Tensor, return_scale: bool = False):
     """Match vf_swiglu_quant: per-32 UE8M0 scale, E4M3 RN sat, return dequant values."""
     num_cols = values.shape[-1]
     assert num_cols % 32 == 0
@@ -91,7 +91,10 @@ def quantize_fp8_golden(values: torch.Tensor) -> torch.Tensor:
     scaled = groups * inv_scale[..., None]
     quant = scaled.clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
     dequant = quant.float() * scale[..., None]
-    return dequant.reshape(*values.shape[:-1], num_cols)
+    dequant = dequant.reshape(*values.shape[:-1], num_cols)
+    if return_scale:
+        return dequant, scale
+    return dequant
 
 
 def swiglu_quant(
@@ -108,6 +111,50 @@ def swiglu_quant(
     if route_weights is not None:
         value = value * route_weights[:, None]
     return quantize_fp8_golden(value)
+
+def _ceil_to_ue8m0(x: torch.Tensor) -> torch.Tensor:
+    bits = x.abs().float().view(torch.int32)
+    exp = ((bits // (2 ** 23)) % 256) + (bits % (2 ** 23)).bool().int()
+    return (exp.clamp(1, 254) << 23).view(torch.float32)
+
+
+def _rne_e2m1(x: torch.Tensor) -> torch.Tensor:
+    table = torch.tensor(_FP4_VALUES[:8], dtype=torch.float32, device=x.device)
+    sign = torch.sign(x)
+    ax = x.abs().clamp(max=6.0)
+    d = (ax.unsqueeze(-1) - table).abs()
+    lo = d.argmin(-1)
+    lo_val = table[lo]
+    hi = (lo + 1).clamp(max=7)
+    hi_val = table[hi]
+    d_lo, d_hi = (ax - lo_val).abs(), (hi_val - ax).abs()
+    tie = (d_lo == d_hi) & (lo < 7)
+    idx = torch.where(tie & (lo % 2 == 1), hi, lo)
+    return table[idx] * torch.where(sign < 0, -1.0, 1.0)
+
+
+def _kernel_quant_e2m1(a: torch.Tensor) -> torch.Tensor:
+    shape = a.shape
+    groups = a.reshape(*shape[:-1], shape[-1] // 32, 32)
+    sf = _ceil_to_ue8m0(groups.abs().amax(dim=-1).clamp(1e-4) / 6.0)
+    sfull = sf.repeat_interleave(32, dim=-1)
+    scaled_bf16 = (a / sfull).to(torch.bfloat16).float()
+    return (_rne_e2m1(scaled_bf16) * sfull).reshape(shape)
+
+
+def swiglu_quant_fp4(
+    gate: torch.Tensor,
+    up: torch.Tensor,
+    route_weights: torch.Tensor | None,
+    activation_clamp: float,
+) -> torch.Tensor:
+    """Match the spike A4W4 path: FP8 code / 64 -> E2M1, SF folded by 2^-6."""
+    gate = torch.minimum(gate, torch.tensor(activation_clamp, device=gate.device))
+    up = torch.clamp(up, -activation_clamp, activation_clamp)
+    value = gate * torch.sigmoid(gate) * up
+    if route_weights is not None:
+        value = value * route_weights[:, None]
+    return _kernel_quant_e2m1(value)
 
 
 def golden_mega_moe(case: MegaMoECase, rank_idx: int) -> torch.Tensor:
@@ -148,7 +195,10 @@ def golden_mega_moe(case: MegaMoECase, rank_idx: int) -> torch.Tensor:
         x_e = x[token_idx]                                  # [n, H]
         l1 = x_e @ w1[expert].T                             # [n, 2I]
         gate, up = l1[:, :intermediate], l1[:, intermediate:]
-        l2_act = swiglu_quant(gate, up, topk_weights[token_idx, slot_idx], clamp)
+        if case.buffer.linear2_fp4:
+            l2_act = swiglu_quant_fp4(gate, up, topk_weights[token_idx, slot_idx], clamp)
+        else:
+            l2_act = swiglu_quant(gate, up, topk_weights[token_idx, slot_idx], clamp)
         l2 = l2_act @ w2[expert].T                          # [n, H]
         # Kernel writes each route to BF16 before the combine accumulation.
         out.index_add_(0, token_idx, l2.to(torch.bfloat16).float())
@@ -156,7 +206,10 @@ def golden_mega_moe(case: MegaMoECase, rank_idx: int) -> torch.Tensor:
     if shared:
         l1 = x @ sw1.T                                      # [T, 2Is]
         gate, up = l1[:, :shared_intermediate], l1[:, shared_intermediate:]
-        l2_act = swiglu_quant(gate, up, None, clamp)
+        if case.buffer.linear2_fp4:
+            l2_act = swiglu_quant_fp4(gate, up, None, clamp)
+        else:
+            l2_act = swiglu_quant(gate, up, None, clamp)
         l2 = l2_act @ sw2.T                                 # [T, H]
         out += l2.to(torch.bfloat16).float()
 
@@ -173,9 +226,12 @@ def main() -> None:
     parser.add_argument("--num-shared-experts", type=int, default=1)
     parser.add_argument("--activation-clamp", type=float, default=7.0)
     parser.add_argument("--threshold", type=float, default=1e-4)
+    parser.add_argument("--mma-type", default="fp4xfp4+fp8xfp4",
+                        choices=("fp4xfp4+fp8xfp4", "fp8xfp4+fp8xfp4", "fp4xfp4+fp4xfp4"))
     args = parser.parse_args()
 
-    if not _npu_is_idle(0):
+    visible = os.environ.get('ASCEND_RT_VISIBLE_DEVICES', '0').split(',')[0]
+    if not _npu_is_idle(int(visible)):
         print("[PAUSE] NPU 0 is busy; not starting the golden check.")
         return
 
@@ -190,6 +246,7 @@ def main() -> None:
         num_shared_experts=args.num_shared_experts,
         activation_clamp=args.activation_clamp,
         with_baseline=False,
+        mma_type=args.mma_type,
     )
     try:
         case.create_inputs(args.num_tokens)

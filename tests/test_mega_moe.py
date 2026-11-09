@@ -55,10 +55,10 @@ class MegaMoECase:
                  with_baseline=True, base=None, mma_type='fp4xfp4+fp8xfp4'):
         rank_idx, num_ranks = group.rank(), group.size()
         num_experts_per_rank = num_experts // num_ranks
-        self.mma_type = mma_type
         self.buffer = deep_gemm.SymmBuffer(
             group, num_experts, num_max_tokens_per_rank, num_topk, hidden, intermediate_hidden,
             num_shared_experts=num_shared_experts, mma_type=mma_type, base=base)
+        self.mma_type = self.buffer.mma_type
         # Match the BF16 clamp consumed by the fused kernel.
         self.activation_clamp = torch.tensor(activation_clamp, dtype=torch.bfloat16, device='cpu').item()
         self.l1_weights = make_npu_fp4((num_experts_per_rank, 2 * intermediate_hidden, hidden), 20000 + rank_idx)
@@ -69,9 +69,10 @@ class MegaMoECase:
         self.transformed_shared_l1_weights = self.transformed_shared_l2_weights = None
         if num_shared_experts:
             shared_intermediate_hidden = num_shared_experts * intermediate_hidden
-            make_shared = make_npu_fp4 if mma_type == 'fp4xfp4+fp8xfp4' else make_npu_fp8
-            self.shared_l1_weights = make_shared((2 * shared_intermediate_hidden, hidden), 24000)
-            self.shared_l2_weights = make_shared((hidden, shared_intermediate_hidden), 25000)
+            make_shared_l1 = make_npu_fp4 if self.mma_type.startswith('fp4') else make_npu_fp8
+            make_shared_l2 = make_npu_fp8 if self.mma_type == 'fp8xfp4+fp8xfp4' else make_npu_fp4
+            self.shared_l1_weights = make_shared_l1((2 * shared_intermediate_hidden, hidden), 24000)
+            self.shared_l2_weights = make_shared_l2((hidden, shared_intermediate_hidden), 25000)
             self.transformed_shared_l1_weights, self.transformed_shared_l2_weights = deep_gemm.transform_weights_for_mega_moe(
                 self.shared_l1_weights, self.shared_l2_weights, mma_type=mma_type)
 
@@ -108,7 +109,7 @@ class MegaMoECase:
     def create_inputs(self, num_tokens, seed_offset=0, invalid_routes=False):
         buffer = self.buffer
         rank_idx = buffer.group.rank()
-        make_x = make_npu_fp4 if self.mma_type == 'fp4xfp4+fp8xfp4' else make_npu_fp8
+        make_x = make_npu_fp4 if self.mma_type.startswith('fp4') else make_npu_fp8
         self.x = make_x((num_tokens, buffer.hidden), 22000 + seed_offset + rank_idx)
         self.topk_idx, self.topk_weights = make_topk(
             num_tokens, buffer.num_topk, buffer.num_experts, 23000 + seed_offset + rank_idx)
@@ -258,9 +259,10 @@ def test(local_rank, args):
 
     # Register once at the largest required capacity; each case gets its own layout views
     (hidden, intermediate), experts, topk, tokens, shared, capacity, _ = max(args.configs, key=buffer_size)
-    base = deep_gemm.SymmBuffer(group, experts, max(tokens, 1) if capacity is None else capacity,
-                                topk, hidden, intermediate, num_shared_experts=shared,
-                                mma_type=args.mma_type)
+    base = deep_gemm.SymmBuffer(
+        group, experts, max(tokens, 1) if capacity is None else capacity,
+        topk, hidden, intermediate, num_shared_experts=shared,
+        mma_type=args.mma_type)
     case_width = len(str(len(args.configs)))
     for case_idx, ((hidden, intermediate_hidden), num_experts, num_topk, num_tokens, shared, capacity, clamp) in enumerate(args.configs, 1):
         capacity = max(num_tokens, 1) if capacity is None else capacity
@@ -304,7 +306,8 @@ if __name__ == '__main__':
     parser.add_argument('--num-max-tokens-per-rank', type=int, nargs='+', default=[None],
                         help='default: actual token count, at least 1')
     parser.add_argument('--activation-clamp', type=float, nargs='+', default=[7.0])
-    parser.add_argument('--mma-type', choices=('fp4xfp4+fp8xfp4', 'fp8xfp4+fp8xfp4'),
+    parser.add_argument('--mma-type', choices=('fp4xfp4+fp8xfp4', 'fp8xfp4+fp8xfp4',
+                                               'fp4xfp4+fp4xfp4'),
                         default='fp4xfp4+fp8xfp4')
 
     # Test settings

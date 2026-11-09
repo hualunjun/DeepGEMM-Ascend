@@ -51,10 +51,27 @@ template <uint32_t kMadM>
 struct FP4MMAConfig {
     static constexpr uint32_t BLOCK_M = layout::BLOCK_M;
     static constexpr uint32_t BLOCK_N = layout::BLOCK_N;
+    // Existing A8W4 strategy with the K tile doubled. This config is shared
+    // by Linear1, so it must keep the original MAD_N selection.
     static constexpr uint32_t BLOCK_K = 2 * MMAConfig<kMadM>::BLOCK_K;
     static constexpr uint32_t MAD_M = kMadM;
     static constexpr uint32_t MAD_K = BLOCK_K / kNumL0Stages;
     static constexpr uint32_t MAD_N = MMAConfig<kMadM>::MAD_N;
+    static_assert(BLOCK_N % MAD_N == 0);
+    static_assert(MAD_M * MAD_K / 2 <= L0ASizeBytes / kNumL0Stages);
+    static_assert(MAD_N * MAD_K / 2 <= L0BSizeBytes / kNumL0Stages);
+};
+
+// Linear2 FP4 tile: K=2304 is divisible by MAD_K=256 for both M choices.
+// Linear1 keeps the original FP4MMAConfig because H=5120 is already aligned.
+template <uint32_t kMadM>
+struct FP4L2MMAConfig {
+    static constexpr uint32_t BLOCK_M = layout::BLOCK_M;
+    static constexpr uint32_t BLOCK_N = layout::BLOCK_N;
+    static constexpr uint32_t BLOCK_K = 512;
+    static constexpr uint32_t MAD_M = kMadM;
+    static constexpr uint32_t MAD_K = 256;
+    static constexpr uint32_t MAD_N = BLOCK_N;
     static_assert(BLOCK_N % MAD_N == 0);
     static_assert(MAD_M * MAD_K / 2 <= L0ASizeBytes / kNumL0Stages);
     static_assert(MAD_N * MAD_K / 2 <= L0BSizeBytes / kNumL0Stages);
@@ -83,6 +100,8 @@ constexpr PipeEvent<PIPE_MTE2, PIPE_V> kFP4Full{0};
 constexpr PipeEvent<PIPE_V, PIPE_MTE2> kFP4Empty{0};
 constexpr PipeEvent<PIPE_MTE2, PIPE_MTE3> kFP4L1Full{0};
 constexpr PipeEvent<PIPE_MTE3, PIPE_MTE2> kFP4L1Empty{0};
+constexpr PipeEvent<PIPE_MTE2, PIPE_MTE3> kFP4L2Full{3};
+constexpr PipeEvent<PIPE_MTE3, PIPE_MTE2> kFP4L2Empty{3};
 constexpr PipeEvent<PIPE_V, PIPE_MTE3> kNZFull{0};
 constexpr PipeEvent<PIPE_MTE3, PIPE_V> kNZEmpty{0};
 constexpr PipeEvent<PIPE_V, PIPE_S> kMetadataDone{0};
@@ -311,7 +330,7 @@ __aicore__ __forceinline__ void combine_reduce(__gm__ uint8_t* buffer, __gm__ bf
 }
 
 // AIV0: Linear2 FP4 weights -> FP8 NZ -> L1B (Linear1 B is loaded directly by AIC)
-template <const auto& workspace, bool kOverlapReduce, bool kLinear1FP4>
+template <const auto& workspace, bool kOverlapReduce, bool kLinear1FP4, bool kLinear2FP4>
 __aicore__ inline void aiv0_weight_pipeline(__gm__ uint8_t* buffer, __gm__ bfloat16_t* output,
                                             uint32_t num_tokens, CombineReduceState<workspace>& reduce, uint32_t num_total_m_blocks,
                                             const layout::Weights& weights, uint32_t core_idx) {
@@ -334,6 +353,8 @@ __aicore__ inline void aiv0_weight_pipeline(__gm__ uint8_t* buffer, __gm__ bfloa
     // Initialize UB reuse credits; AIC releases the initial L1B credits.
     notify<PIPE_V, PIPE_MTE2, kNumFP4L2Stages>(kFP4Empty);
     notify<PIPE_MTE3, PIPE_MTE2, kNumFP4L1Stages>(kFP4L1Empty);
+    if constexpr (kLinear2FP4)
+        notify<PIPE_MTE3, PIPE_MTE2, kNumFP4L2Stages>(kFP4L2Empty);
     notify<PIPE_MTE3, PIPE_V, kNumNZL2Stages>(kNZEmpty);
 
     // Size the reduce window from local output tokens
@@ -436,6 +457,50 @@ __aicore__ inline void aiv0_weight_pipeline(__gm__ uint8_t* buffer, __gm__ bfloa
                 continue;
         }
 
+        if constexpr (kLinear2FP4) {
+            if (not is_linear1) {
+                // Linear2 native FP4: host weights are K-major packed; publish directly to L1B.
+                const auto load_l2_fp4 = [&]<uint32_t MAD_M>() __aicore__ {
+                    constexpr uint32_t BLOCK_K = FP4L2MMAConfig<MAD_M>::BLOCK_K;
+                    constexpr uint32_t MAD_N = FP4L2MMAConfig<MAD_M>::MAD_N;
+                    constexpr uint32_t HALF_K = BLOCK_K / 2;
+                    constexpr uint32_t HALF_BYTES = MAD_N * HALF_K / 2;
+                    constexpr l1_ptr<float4_e2m1x2_t, Major::K> l1b(MAD_N, BLOCK_K, kL1BBaseBytes);
+                    for (uint32_t k_idx = 0; k_idx < num_k; k_idx += BLOCK_K) {
+                        const uint32_t valid_k = min(BLOCK_K, num_k - k_idx);
+                        for (uint32_t n_mad_idx = 0; n_mad_idx < BLOCK_N; n_mad_idx += MAD_N) {
+                            wait_intra_block<PIPE_MTE3, 0>(kL1BEmpty, l1b_stage_idx);
+                            for (uint32_t half = 0; half < 2; ++ half) {
+                                const uint32_t half_k = min(HALF_K, valid_k - half * HALF_K);
+                                if (half_k == 0)
+                                    break;
+                                wait<PIPE_MTE3, PIPE_MTE2>(kFP4L2Empty, fp4_l2_stage_idx);
+                                const auto src = weight_data +
+                                    static_cast<uint64_t>((k_idx + half * HALF_K) / 64) * BLOCK_N * 32 +
+                                    n_mad_idx * 32;
+                                copy_gm_to_ub(ub_fp4_l2[fp4_l2_stage_idx], const_cast<__gm__ uint8_t*>(src),
+                                              half_k / 64, MAD_N * 32, BLOCK_N * 32, MAD_N * 32,
+                                              weight_l2_hint);
+                                notify<PIPE_MTE2, PIPE_MTE3>(kFP4L2Full, fp4_l2_stage_idx);
+                                wait<PIPE_MTE2, PIPE_MTE3>(kFP4L2Full, fp4_l2_stage_idx);
+                                asc_copy_ub2l1(l1b[l1b_stage_idx].template ptr<uint8_t>() + half * HALF_BYTES,
+                                               ub_fp4_l2[fp4_l2_stage_idx].ptr(),
+                                               half_k / 64, MAD_N, 0, 0);
+                                notify<PIPE_MTE3, PIPE_MTE2>(kFP4L2Empty, fp4_l2_stage_idx);
+                                fp4_l2_stage_idx = (fp4_l2_stage_idx + 1) % kNumFP4L2Stages;
+                            }
+                            notify_intra_block<PIPE_MTE3, 0>(kL1BFull, l1b_stage_idx);
+                            l1b_stage_idx = (l1b_stage_idx + 1) % kNumL1BStages;
+                        }
+                    }
+                };
+                // Use M=128 only when the whole launch is small enough that every
+                // task takes M=128; mixing M=128/M=256 tasks is unstable.
+                load_l2_fp4.template operator()<256>();
+                continue;
+            }
+        }
+
         // Linear2 keeps W4A8: shared and routed both dequantize FP4 -> FP8.
         const auto load_l2_weights = [&]<uint32_t MAD_M>() __aicore__ {
             constexpr uint32_t BLOCK_K = MMAConfig<MAD_M>::BLOCK_K;
@@ -488,7 +553,7 @@ __aicore__ inline void aiv0_weight_pipeline(__gm__ uint8_t* buffer, __gm__ bfloa
 }
 
 // AIC: shared and routed GEMMs
-template <const auto& workspace, bool kOverlapReduce = false, bool kLinear1FP4 = true>
+template <const auto& workspace, bool kOverlapReduce = false, bool kLinear1FP4 = true, bool kLinear2FP4 = false>
 __aicore__ inline void aic_gemm_pipeline(__gm__ uint8_t* buffer, uint32_t num_tokens, uint32_t rank_idx,
                                          const layout::Weights& weights, uint32_t core_idx) {
     constexpr auto& config = workspace.config;
@@ -584,15 +649,17 @@ __aicore__ inline void aic_gemm_pipeline(__gm__ uint8_t* buffer, uint32_t num_to
         const uint64_t input_m_idx = static_cast<uint64_t>(input_block_idx) * BLOCK_M;
         const auto input_l1 = input_layout_l1.data.get_ptr(buffer,
             input_m_idx * ((is_linear1 and kLinear1FP4) ? (num_k / 2) : num_k));
-        const auto input_l2 = input_layout_l2.data.get_ptr(buffer, input_m_idx * num_k);
+        const auto input_l2 = input_layout_l2.data.get_ptr(
+            buffer, input_m_idx * (kLinear2FP4 ? num_k / 2 : num_k));
         const uintptr_t input_addr = is_linear1 ? reinterpret_cast<uintptr_t>(input_l1)
                                                 : reinterpret_cast<uintptr_t>(input_l2);
         const auto input_sf = is_linear1
             ? input_layout_l1.sf.get_ptr(buffer, input_m_idx * num_sf_pairs)
             : input_layout_l2.sf.get_ptr(buffer, input_m_idx * num_sf_pairs);
 
-        const auto compute = [&]<uint32_t MAD_M, bool kIsFP4>() __aicore__ {
-            using cfg_t = std::conditional_t<kIsFP4, FP4MMAConfig<MAD_M>, MMAConfig<MAD_M>>;
+        const auto compute = [&]<uint32_t MAD_M, bool kIsFP4, bool kL2FP4 = false>() __aicore__ {
+            using cfg_t = std::conditional_t<kL2FP4, FP4L2MMAConfig<MAD_M>,
+                                             std::conditional_t<kIsFP4, FP4MMAConfig<MAD_M>, MMAConfig<MAD_M>>>;
             constexpr uint32_t BLOCK_K = cfg_t::BLOCK_K;
             constexpr uint32_t MAD_K = cfg_t::MAD_K;
             constexpr uint32_t MAD_N = cfg_t::MAD_N;
@@ -804,10 +871,14 @@ __aicore__ inline void aic_gemm_pipeline(__gm__ uint8_t* buffer, uint32_t num_to
                     compute.template operator()<256, false>();
             }
         } else {
-            if (shape_m <= 128)
-                compute.template operator()<128, false>();
-            else
-                compute.template operator()<256, false>();
+            if constexpr (kLinear2FP4) {
+                compute.template operator()<256, true, true>();
+            } else {
+                if (shape_m <= 128)
+                    compute.template operator()<128, false>();
+                else
+                    compute.template operator()<256, false>();
+            }
         }
 
         asc_store_dev(num_issued_gemms_ptr, ++ num_issued_gemms);
@@ -817,7 +888,7 @@ __aicore__ inline void aic_gemm_pipeline(__gm__ uint8_t* buffer, uint32_t num_to
 }
 
 // AIV1: epilogue, dispatch, and combine
-template <const auto& workspace, bool kOverlapReduce, bool kLinear1FP4>
+template <const auto& workspace, bool kOverlapReduce, bool kLinear1FP4, bool kLinear2FP4>
 __aicore__ inline void aiv1_epilogue_comm(__gm__ uint8_t* buffer, __gm__ bfloat16_t* output,
                                           uint32_t num_tokens, uint32_t rank_idx,
                                           CombineReduceState<workspace>& reduce,
@@ -1086,13 +1157,24 @@ __aicore__ inline void aiv1_epilogue_comm(__gm__ uint8_t* buffer, __gm__ bfloat1
 
             // Quantize one row group
             const auto input = ub_accum[stage_idx].ptr() + m_idx_in_stage * BLOCK_N;
-            const auto output = reinterpret_cast<__ubuf__ float8_e4m3_t*>(ub_accum[stage_idx].ptr()) +
-                                m_idx_in_stage * (BLOCK_N / 2);
             const auto output_sf = ub_output_sf[stage_idx].ptr() + m_idx_in_stage;
-            if (is_shared) {
-                vf_swiglu_quant<false, STORE_BLOCK_M>(input, output, output_sf, nullptr, step_m, activation_clamp);
+            if constexpr (kLinear2FP4) {
+                const auto output_fp4 = reinterpret_cast<__ubuf__ uint8_t*>(ub_accum[stage_idx].ptr()) +
+                                        m_idx_in_stage * (BLOCK_N / 4);
+                if (is_shared) {
+                    vf_swiglu_quant_fp4<false, STORE_BLOCK_M>(input, output_fp4, output_sf, nullptr, step_m, activation_clamp);
+                } else {
+                    vf_swiglu_quant_fp4<true, STORE_BLOCK_M>(input, output_fp4, output_sf,
+                                                             ub_route_weights.ptr() + m_idx_in_stage, step_m, activation_clamp);
+                }
             } else {
-                vf_swiglu_quant<true, STORE_BLOCK_M>(input, output, output_sf, ub_route_weights.ptr() + m_idx_in_stage, step_m, activation_clamp);
+                const auto output = reinterpret_cast<__ubuf__ float8_e4m3_t*>(ub_accum[stage_idx].ptr()) +
+                                    m_idx_in_stage * (BLOCK_N / 2);
+                if (is_shared) {
+                    vf_swiglu_quant<false, STORE_BLOCK_M>(input, output, output_sf, nullptr, step_m, activation_clamp);
+                } else {
+                    vf_swiglu_quant<true, STORE_BLOCK_M>(input, output, output_sf, ub_route_weights.ptr() + m_idx_in_stage, step_m, activation_clamp);
+                }
             }
             epi.m_idx_in_block += step_m;
 
@@ -1107,15 +1189,22 @@ __aicore__ inline void aiv1_epilogue_comm(__gm__ uint8_t* buffer, __gm__ bfloat1
                 const uint64_t output_m_idx = static_cast<uint64_t>(
                     is_shared ? pool_block_idx : layout::get_ring_block_idx<workspace>(pool_block_idx)) * BLOCK_M;
                 const auto dst_layout = is_shared ? workspace.shared_l2_acts : workspace.routed.l2_acts;
-                const uint32_t num_cols = num_n_blocks * (BLOCK_N / 2);
-                const uint32_t num_sf_pairs = num_cols / MX_SF_DIVISOR;
+                const uint32_t num_unpacked_cols = num_n_blocks * (BLOCK_N / 2);
+                const uint32_t num_data_cols = kLinear2FP4 ? num_unpacked_cols / 2 : num_unpacked_cols;
+                const uint32_t num_sf_pairs = num_unpacked_cols / MX_SF_DIVISOR;
+                const uint32_t dst_col = n_block_idx * (kLinear2FP4 ? BLOCK_N / 4 : BLOCK_N / 2);
                 const auto dst = dst_layout.data.get_ptr(buffer,
-                    (output_m_idx + stage_m_begin) * num_cols + n_block_idx * (BLOCK_N / 2));
+                    (output_m_idx + stage_m_begin) * num_data_cols + dst_col);
                 const auto dst_sf = dst_layout.sf.get_ptr(buffer,
                     output_m_idx * num_sf_pairs + n_block_idx * kNumOutputSFPairs * BLOCK_M + stage_m_begin);
 
-                copy_ub_to_gm(dst, ub_ptr<float8_e4m3_t>(STORE_BLOCK_M, BLOCK_N / 2, ub_accum[stage_idx].addr),
-                              stage_valid_m, BLOCK_N / 2, num_cols, kWriteThroughShare);
+                if constexpr (kLinear2FP4) {
+                    copy_ub_to_gm(dst, ub_ptr<uint8_t>(STORE_BLOCK_M, BLOCK_N / 4, ub_accum[stage_idx].addr),
+                                  stage_valid_m, BLOCK_N / 4, num_data_cols, kWriteThroughShare);
+                } else {
+                    copy_ub_to_gm(dst, ub_ptr<float8_e4m3_t>(STORE_BLOCK_M, BLOCK_N / 2, ub_accum[stage_idx].addr),
+                                  stage_valid_m, BLOCK_N / 2, num_data_cols, kWriteThroughShare);
+                }
                 copy_ub_to_gm(dst_sf, ub_output_sf[stage_idx],
                               kNumOutputSFPairs, stage_valid_m, BLOCK_M * sizeof(int16_t), kWriteThroughShare);
                 notify_intra_block<PIPE_MTE3, 1>(kEpilogueEmpty, stage_idx);
@@ -1274,7 +1363,7 @@ __aicore__ inline void aiv1_epilogue_comm(__gm__ uint8_t* buffer, __gm__ bfloat1
 
 template <uint32_t kNumRanks, uint32_t kNumExperts, uint32_t kNumSharedExperts,
           uint32_t kNumMaxTokensPerRank, uint32_t kNumTopk, uint32_t kHidden, uint32_t kIntermediateHidden,
-          bool kLinear1FP4 = true>
+          bool kLinear1FP4 = true, bool kLinear2FP4 = false>
 __global__ __mix__(1, 2) void mega_moe_impl(__gm__ bfloat16_t* output, __gm__ int32_t* cumulative_local_expert_recv_stats,
                                             __gm__ const uint8_t* l1_weights, __gm__ const int16_t* l1_weights_sf,
                                             __gm__ const uint8_t* l2_weights, __gm__ const int16_t* l2_weights_sf,
@@ -1284,7 +1373,7 @@ __global__ __mix__(1, 2) void mega_moe_impl(__gm__ bfloat16_t* output, __gm__ in
                                             layout::SymBuffer<> sym_buffer) {
     constexpr auto& workspace = layout::kWorkspace<kNumRanks, kNumExperts, kNumSharedExperts,
                                                    kNumMaxTokensPerRank, kNumTopk, kHidden, kIntermediateHidden,
-                                                   kLinear1FP4>;
+                                                   kLinear1FP4, kLinear2FP4>;
     constexpr auto& config = workspace.config;
 
     // Measured 32 MiB combine-work threshold for tail reduction
@@ -1311,7 +1400,7 @@ __global__ __mix__(1, 2) void mega_moe_impl(__gm__ bfloat16_t* output, __gm__ in
 
     // AIC: GEMMs, then wait for both AIVs
     if ASCEND_IS_AIC {
-        aic_gemm_pipeline<workspace, kOverlapReduce, kLinear1FP4>(buffer, num_tokens, rank_idx, weights, core_idx);
+        aic_gemm_pipeline<workspace, kOverlapReduce, kLinear1FP4, kLinear2FP4>(buffer, num_tokens, rank_idx, weights, core_idx);
         asc_sync_block_wait(PIPE_S, kCombineDoneID);
         return;
     }
@@ -1358,10 +1447,10 @@ __global__ __mix__(1, 2) void mega_moe_impl(__gm__ bfloat16_t* output, __gm__ in
         asc_store_dev(workspace.progress.metadata_ready.get_ptr(buffer, core_idx), uint8_t{1});
         notify_intra_block<PIPE_S, 0>(kMetadataFull);
 
-        aiv0_weight_pipeline<workspace, kOverlapReduce, kLinear1FP4>(buffer, output, num_tokens, reduce, num_total_m_blocks, weights, core_idx);
+        aiv0_weight_pipeline<workspace, kOverlapReduce, kLinear1FP4, kLinear2FP4>(buffer, output, num_tokens, reduce, num_total_m_blocks, weights, core_idx);
     } else {
         // AIV1: epilogue and communication
-        aiv1_epilogue_comm<workspace, kOverlapReduce, kLinear1FP4>(buffer, output, num_tokens, rank_idx, reduce, activation_clamp, core_idx, sym_buffer);
+        aiv1_epilogue_comm<workspace, kOverlapReduce, kLinear1FP4, kLinear2FP4>(buffer, output, num_tokens, rank_idx, reduce, activation_clamp, core_idx, sym_buffer);
     }
 
     combine_reduce<workspace, kOverlapReduce>(buffer, output, num_tokens, rank_idx, aiv_idx, reduce, sym_buffer);
